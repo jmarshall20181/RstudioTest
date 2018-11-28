@@ -1,0 +1,588 @@
+---
+title: "v2.OPEX_Forecast.Rolling.Stock.Focus"
+author: "Jason Marshall"
+date: "August 27, 2018"
+output: word_document
+---
+
+#v2 Time series analysis looking at lower levels of rolling stock expense
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libs, include=FALSE, echo=FALSE, include = FALSE}
+library(forecast) #time series forecast
+library(tidyquant)
+library(timetk) #edit time serices objects
+library(sweep) #tidy model outputs
+library(tidyverse) #tidy data
+library(broom) #tidy ts model outputs
+library(timeDate) #edit ts objects
+library(reshape2) #shape data
+library(data.table) #shape data setDT
+library(readr) #data inport
+library(corrr)      # Tidy correlation tables and correlation plotting
+library(cowplot)    # Multiple plots with plot_grid()
+library(tseries) #adf.test
+library(astsa) #lag plot
+library(TSA)
+#library(DataExplorer) #exploratory data analysis
+#library(Hmisc)
+#library(caret) #model building
+library(quantreg) #quantile regression
+library(GGally)
+```
+
+```{r load expense data from above code chunk, echo=FALSE}
+####################################################################################
+expense.dataset <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/rolling.stock.focus/US.Rolling.Stock.Expense.csv", 
+    col_types = cols(Amount = col_number()))
+
+# make unique col names
+ colsNamesShelf <-colnames(expense.dataset)
+ dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+ colnames(expense.dataset) <- dataset_col_names
+
+#add date column
+ expense.dataset <- expense.dataset %>%
+   #add day 01 just to get a complete date
+   mutate(day.holder = 01) %>%
+   #add year and month
+   mutate(date.holder = paste(Year, Acct.Per, day.holder, sep = "-"))
+
+#set date.holder as date
+ expense.dataset$date.holder <- as.Date(expense.dataset$date.holder)
+
+# #get last day of the month
+ expense.dataset$Date <- as.Date(timeDate::timeLastDayInMonth(expense.dataset$date.holder))
+
+#Filter closed, wholesale, terminal, DC divisions
+expense.dataset <- expense.dataset %>% 
+  filter(str_detect(Division, "Admin") == FALSE) %>% 
+  filter(str_detect(Division, "Closed") == FALSE) %>%
+  filter(str_detect(Division, "DC") == FALSE) %>%
+  filter(str_detect(Division, "Distribution") == FALSE) %>%
+  filter(str_detect(Division, "Wholesale") == FALSE) %>%
+  filter(str_detect(Division, "Terminals") == FALSE) %>%
+  filter(str_detect(Division, "Terminal") == FALSE)
+
+#change strings to factors
+expense.dataset <- expense.dataset %>% mutate_if(is.character, as.factor)
+
+#unit test
+#unique(expense.dataset$Division)
+levels(expense.dataset$Division)
+
+#summary check
+summary(expense.dataset)
+
+#fill NAs
+#expense.dataset %>% filter(is.na(Amount))
+expense.dataset$Amount <- replace_na(expense.dataset$Amount, 0)
+
+#summary check
+expense.dataset %>% group_by(Division) %>% summarise(sum = sum(Amount))
+summary(expense.dataset)
+```
+
+```{r create time series object: US Country Level, echo=FALSE}
+#subset down to US Total Sum
+US.Total.Expense.Dataset <- expense.dataset %>%
+  #group by US
+  group_by(Date, Account, Geography) %>%
+  #sum expense amounts
+  summarise(Expense.Sum = sum(Amount))
+
+summary(US.Total.Expense.Dataset)
+
+#unit test
+sum(expense.dataset$Amount) == sum(US.Total.Expense.Dataset$Expense.Sum)
+
+#make wide version
+US.Total.Expense.Dataset <- dcast(data.table::setDT(US.Total.Expense.Dataset), 
+                                     formula = Date + Geography ~ Account,
+                                     value.var = c("Expense.Sum"),
+                                     fun.aggregate = sum)
+# make unique col names
+ colsNamesShelf <-colnames(US.Total.Expense.Dataset)
+ dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+ colnames(US.Total.Expense.Dataset) <- dataset_col_names
+colnames(US.Total.Expense.Dataset)
+  
+#create total Rolling stock column
+US.Total.Expense.Dataset <- US.Total.Expense.Dataset %>%
+  mutate(Total.Rolling.Stock = X538004...R.M.Delivery.Plant.Vehicles + 
+           X538006...R.M.Field.Equipment + 
+           X538004...R.M.Delivery.Plant.Vehicles + 
+           X538007...R.M.Passenger.Vehicles)
+
+#summary check
+#summary(US.Total.Expense.Dataset)
+
+#fill NAs 
+#US.Total.Expense.Dataset[is.na(US.Total.Expense.Dataset)] <- 0
+
+#sort oldest to newest
+US.Total.Expense.Dataset <- US.Total.Expense.Dataset %>%
+  arrange(Date)
+
+#create ts object drop first two cols (non-numeric)
+#use.tk_xts to automate frequency parameter
+US.Total.Expense.Dataset.TS <- timetk::tk_xts(data = US.Total.Expense.Dataset,
+                                              select = -c(Geography),
+                                              date_var = Date)
+
+US.Total.Expense.Dataset.TS <- timetk::tk_ts(data = US.Total.Expense.Dataset.TS,
+                                             start = c(2013,1), frequency = 12)
+
+#filter data to 2014 to match sales data
+#US.Total.Expense.Dataset.TS <- window(US.Total.Expense.Dataset.TS, start = c(2014,1))
+
+#Unit Test
+summary(US.Total.Expense.Dataset.TS)
+start(US.Total.Expense.Dataset.TS)
+end(US.Total.Expense.Dataset.TS)
+
+#drop other datasets to help with file size
+#rm(expense.dataset)
+#rm(US.Total.Expense.Dataset)
+```
+
+```{r add sales data, echo=FALSE}
+US.Sales.Data <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US_Region_Division_Added_Only_NA_Item_Sales_chopdown_test a557ef9eb.csv")
+
+# #make unique col names
+colsNamesShelf <-colnames(US.Sales.Data)
+dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+colnames(US.Sales.Data) <- dataset_col_names
+
+#edit date format 
+US.Sales.Data$Invoice.Date <- as.Date(US.Sales.Data$Invoice.Date, format = '%B %d, %Y')
+
+#change invoice date to last month of the year for monthly sum and join with expense data
+US.Sales.Data$Invoice.Date <- timeLastDayInMonth(US.Sales.Data$Invoice.Date) 
+
+#change to character to facilitate group_by below
+US.Sales.Data$Invoice.Date <- as.character(US.Sales.Data$Invoice.Date)
+```
+
+```{r shape sales data, echo=FALSE}
+#Sum net sales and total margin
+US.Sales.Data.cutdown <- US.Sales.Data %>%
+  #Select Data
+  dplyr::select(Invoice.Date, GL.Shelf, Net.Sales, Total.Margin) %>%
+  dplyr::group_by(Invoice.Date, GL.Shelf) %>% 
+  dplyr::summarise(Net.Sales = sum(Net.Sales), Total.Margin = sum(Total.Margin))
+  
+#unit test
+sum(US.Sales.Data$Net.Sales) == sum(US.Sales.Data.cutdown$Net.Sales)
+sum(US.Sales.Data$Total.Margin) == sum(US.Sales.Data.cutdown$Total.Margin)
+```
+
+```{r US Sales Time Series, echo=FALSE
+#convert us.sales.data.cutdown to date for sort
+US.Sales.Data$Invoice.Date <- as.Date(US.Sales.Data$Invoice.Date)
+#sort by date
+US.Sales.Data$Invoice.Date <- sort(US.Sales.Data$Invoice.Date, decreasing = FALSE)
+
+#create ts object
+US.Sales.Data.TS <- US.Sales.Data %>%
+  dplyr::select(Invoice.Date, GL.Shelf, Net.Sales, Total.Margin)
+
+#start making TS object
+#create wide version of data
+US.Sales.Data.TS <- dcast(data = data.table::setDT(US.Sales.Data.cutdown), 
+                                  formula = Invoice.Date ~ GL.Shelf,
+                                  value.var = c('Net.Sales', 'Total.Margin'),
+                                  fun.aggregate = sum) %>%
+  #add total sum columns for net.sales and total.margin
+  mutate(Net.Sales_Total = (Net.Sales_APPL + Net.Sales_CHEM + Net.Sales_FERT + Net.Sales_OTHE + Net.Sales_SEED)) %>%
+  mutate(Total.Margin_Total = (Total.Margin_APPL + Total.Margin_CHEM + Total.Margin_FERT + Total.Margin_OTHE + Total.Margin_SEED))
+
+#convert Invoice.date back to date 
+US.Sales.Data.TS$Invoice.Date <- as.Date(US.Sales.Data.TS$Invoice.Date)
+
+#convert to ts object
+#use.tk_xts to automate frequency parameter
+US.Sales.Data.TS <- timetk::tk_xts(US.Sales.Data.TS, date_var = Invoice.Date) %>% 
+  timetk::tk_ts(start = c(2014,1), frequency = 12)
+
+#join ts objects
+US.Sales.expense.Data.TS <- ts.intersect(US.Total.Expense.Dataset.TS, US.Sales.Data.TS)
+
+#set new col names
+colnames(US.Sales.expense.Data.TS)
+
+US.Sales.expense.Data.TS <- US.Sales.expense.Data.TS %>% 
+  timetk::tk_tbl() %>%
+  setNames(.,c("index", "Fuel.Petrol", "Deliverly.Plant.Vehicle", "Field.Equipment", "Passenger.Vehicle", "Total.Rolling.Stock",
+               "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+           "marg.appl", "marg.chem", "margin.fert", "margin.other", "margin.seed", "total.sales", "total.marg")) 
+
+#set new col names
+colnames(US.Sales.expense.Data.TS)
+
+US.Sales.expense.Data.TS <- US.Sales.expense.Data.TS %>%
+  timetk::tk_ts(start = c(2014,1), frequency = 12)
+```
+
+```{r plot variables against fuel petrol, echo=FALSE}
+cols <-  colnames(US.Sales.expense.Data.TS)
+cols
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(US.Sales.expense.Data.TS[,c(1,i)]) + 
+    ggtitle(paste("Fuel/Petrol vs", cols[i], sep = " ")) + 
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+```
+
+```{r plot variables against deliery plant vehics, echo=FALSE}
+cols <- colnames(US.Sales.expense.Data.TS)
+#cols
+#cols[i]
+for (i in c(1,3:length(cols))){
+  data.plot <- autoplot(US.Sales.expense.Data.TS[,c(2,i)]) + 
+    ggtitle(paste("delivery plant vehicle vs", cols[i], sep = " ")) + 
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+```
+```{r plot variables against R.M.Field.Equipment, echo=FALSE}
+cols <- colnames(US.Sales.expense.Data.TS)
+#cols
+#cols[i]
+for (i in c(1:2,4:length(cols))){
+  data.plot <- autoplot(US.Sales.expense.Data.TS[,c(3,i)]) + 
+    ggtitle(paste("R.M.Field.Equipment vs", cols[i], sep = " ")) + 
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+```
+
+```{r plot variables against R.M.Passenger.Vehicles, echo=FALSE}
+cols <- colnames(US.Sales.expense.Data.TS)
+#cols
+#cols[i]
+for (i in c(1:3,5:length(cols))){
+  data.plot <- autoplot(US.Sales.expense.Data.TS[,c(4,i)]) + 
+    ggtitle(paste("R.M.Passenger.Vehicles vs", cols[i], sep = " ")) + 
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+```
+
+```{r plot variables against Total.Rolling.Stock, echo=FALSE}
+cols <- colnames(US.Sales.expense.Data.TS)
+#cols
+#cols[i]
+for (i in c(1:4,6:length(cols))){
+  data.plot <- autoplot(US.Sales.expense.Data.TS[,c(5,i)]) + 
+    ggtitle(paste("Total.Rolling.Stock vs", cols[i], sep = " ")) + 
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+```
+
+```{r Season Plot for each variable, echo=FALSE}
+cols <- colnames(US.Sales.expense.Data.TS)
+
+for (i in cols){
+  data.plot <- ggseasonplot(US.Sales.expense.Data.TS[,i]) +
+    ggtitle(paste("Season Plot:", i, sep = " "))
+  
+  print(data.plot)
+}
+```
+
+```{r sub Season Plot for each variable}
+cols <- colnames(US.Sales.expense.Data.TS)
+
+for (i in cols){
+  data.plot <- ggsubseriesplot(US.Sales.expense.Data.TS[,i]) +
+    ggtitle(paste("Subseries Plot:", i, sep = " "))
+  
+  print(data.plot)
+}
+```
+
+```{r Box  Plot for each variable}
+for (i in cols){
+  box.plot <- boxplot(US.Sales.expense.Data.TS[,i] ~ cycle(US.Sales.expense.Data.TS[,i]), 
+                      main = paste("Box Plot:", i, sep = " "))
+  print(box.plot)
+  }
+```
+
+```{r pairs plots}
+US.Sales.expense.Data.TS[,1:4] %>% 
+  timetk::tk_tbl() %>% 
+  ggpairs()
+```
+
+```{R correlations, echo = FALSE}
+#colnames(US.Total.Expense.Dataset.roll.stock.xts)
+
+ Correlations <- US.Sales.expense.Data.TS %>%
+  timetk::tk_xts() %>% 
+  corrr::correlate()
+  
+print(Correlations)
+
+# #Network Plot
+# US.Total.Expense.Dataset.roll.stock.xts %>%
+#   timetk::tk_tbl() %>% 
+#   setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+#            "marg.appl", "marg.chem", "marg.fert", "marg.other", "marg.seed", "tot.sales", "tot.marg")) %>%
+#   dplyr::select(roll.stock, sales.appl, sales.chem, sales.fert, sales.other, sales.seed,
+#            marg.appl, marg.chem, marg.fert, marg.other, marg.seed, tot.sales, tot.marg ) %>%
+#   corrr::correlate() %>%
+#   network_plot(colours = c(palette_light()[[2]], "white", palette_light()[[4]]), legend = TRUE) +
+#     # labs(
+#     #     title = "Title",
+#     #     subtitle = "Subtitle"
+#     #     ) +
+#     expand_limits(x = c(-0.75, 0.25), y = c(-0.4, 0.4)) +
+#     theme_tq() +
+#     theme(legend.position = "bottom")
+```
+
+```{r ACF plots to test for seasonality}
+cols <- colnames(US.Sales.expense.Data.TS)
+
+for (i in cols){
+  data.plot.1 <- ggAcf(US.Sales.expense.Data.TS[,i]) +
+    ggtitle(paste("ACF Plot:", i, sep = " "))
+  
+  print(data.plot.1)
+}
+```
+
+```{r PACF Plots}
+cols <- colnames(US.Sales.expense.Data.TS)
+
+for (i in cols){
+  data.plot.1 <- ggPacf(US.Sales.expense.Data.TS[,i]) +
+    ggtitle(paste("PACF Plot:", i, sep = " "))
+  
+  print(data.plot.1)
+}
+```
+
+```{r ACF plots to test for seasonality with diff}
+cols <- colnames(US.Sales.expense.Data.TS)
+
+for (i in cols){
+  data.plot.1 <- ggAcf(diff(US.Sales.expense.Data.TS[,i], lag = 12)) +
+    ggtitle(paste("ACF Plot:", i, sep = " "))
+  
+  print(data.plot.1)
+}
+```
+
+```{r PACF plots to test for seasonality with diff}
+cols <- colnames(US.Sales.expense.Data.TS)
+
+for (i in cols){
+  data.plot.1 <- ggPacf(diff(US.Sales.expense.Data.TS[,i], lag = 12)) +
+    ggtitle(paste("ACF Plot:", i, sep = " "))
+  
+  print(data.plot.1)
+}
+```
+
+#model building
+```{r fuel petrol, echo = FALSE}
+#acf plot
+ggAcf(US.Sales.expense.Data.TS[,1])
+#commentary: sig lag at 1 and 12
+
+ggAcf(diff(US.Sales.expense.Data.TS[,1], lag = 1))
+#commentary lag remains at 12 
+
+ggAcf(diff(US.Sales.expense.Data.TS[,1], lag = 12))
+#starting with seasonal dif doesnt appear to work as well in reducing autocorrelation
+
+#take 1st diff and then take seasonal
+ggAcf(diff(diff(US.Sales.expense.Data.TS[,1], lag = 1), lag = 12))
+
+#partial acf of diffed data
+ggPacf(diff(diff(US.Sales.expense.Data.TS[,1], lag = 12), lag = 1))
+
+fuel.petrol.mod1 <- auto.arima(US.Sales.expense.Data.TS[,1], seasonal = TRUE,
+                               stepwise = FALSE, 
+                               approximation = FALSE)
+fuel.petrol.mod2 <- auto.arima(US.Sales.expense.Data.TS[,1], d = 1, seasonal = TRUE)
+fuel.petrol.mod3 <- auto.arima(US.Sales.expense.Data.TS[,1], D = 1, seasonal = TRUE)
+fuel.petrol.mod4 <- auto.arima(US.Sales.expense.Data.TS[,1], d = 1, D = 1, 
+                               seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+#fuel.petrol.mod5 <- auto.arima(US.Sales.expense.Data.TS[,1], d = 1, D = 1, 
+#                               stepwise = FALSE, approximation = FALSE)
+
+fuel.petrol.mod1
+fuel.petrol.mod2
+fuel.petrol.mod3
+fuel.petrol.mod4
+#fuel.petrol.mod5
+
+#fcast fuel.petrol.mod4 best AIC
+
+fcast.ARIMA.1 <- forecast(fuel.petrol.mod4, h = 12)
+
+plot <- autoplot(fcast.ARIMA.1, series="Forecast") +
+    autolayer(fuel.petrol.mod4$fitted, series="Forecast Model") +
+    autolayer(US.Sales.expense.Data.TS[,1], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast ROlling Stock Test No ExtVars", i, sep = " "))
+  
+print(plot)
+checkresiduals(fuel.petrol.mod4)
+```
+
+```{r delivery plant vehix, echo=FALSE}
+autoplot(US.Sales.expense.Data.TS[,2])
+
+#Delivery plant vehicle Acf
+ggAcf(US.Sales.expense.Data.TS[,2])
+#sig lag @1 with seasonal lag pattern
+
+#first diff 
+ggAcf(diff(US.Sales.expense.Data.TS[,2], lag = 1))
+#autocorr extracted
+
+#build arima model
+del.plant.vehix.arima.1 <- auto.arima(US.Sales.expense.Data.TS[,2], d = 1, 
+                               seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+#print model
+del.plant.vehix.arima.1
+
+#forecast model
+fcast.del.plant.vehix.arima.1 <- forecast(del.plant.vehix.arima.1, h = 12)
+
+plot <- autoplot(fcast.del.plant.vehix.arima.1, series="Forecast") +
+    autolayer(del.plant.vehix.arima.1$fitted, series="Forecast Model") +
+    autolayer(US.Sales.expense.Data.TS[,2], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast ROlling Stock Test No ExtVars", i, sep = " "))
+  
+print(plot)
+checkresiduals(del.plant.vehix.arima.1)
+```
+
+```{r field equip, echo=FALSE}
+autoplot(US.Sales.expense.Data.TS[,3])
+
+#Delivery plant vehicle Acf
+ggAcf(US.Sales.expense.Data.TS[,3])
+#sig lag @1 with seasonal lag pattern
+
+#first diff 
+ggAcf(diff(US.Sales.expense.Data.TS[,3], lag = 1))
+#autocorr extracted
+
+#build arima model
+field.equip.arima.1 <- auto.arima(US.Sales.expense.Data.TS[,3], d = 1, 
+                               seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+#print model
+field.equip.arima.1
+
+#forecast model
+fcast.field.equip.arima.1 <- forecast(field.equip.arima.1, h = 12)
+
+plot <- autoplot(fcast.field.equip.arima.1, series="Forecast") +
+    autolayer(field.equip.arima.1$fitted, series="Forecast Model") +
+    autolayer(US.Sales.expense.Data.TS[,3], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast field equip", i, sep = " "))
+  
+print(plot)
+checkresiduals(field.equip.arima.1)
+```
+
+```{r passenger vehix, echo=FALSE}
+#variable to sup into code
+var = 4
+
+autoplot(US.Sales.expense.Data.TS[,var])
+
+#Delivery plant vehicle Acf
+ggAcf(US.Sales.expense.Data.TS[,var])
+#sig lag @1 with seasonal lag pattern
+
+#first diff 
+ggAcf(diff(US.Sales.expense.Data.TS[,var], lag = 1))
+#autocorr extracted
+
+#plot diffed data
+autoplot(diff(US.Sales.expense.Data.TS[,var], lag = 1))
+
+#build arima model
+passenger.vehix.arima.1 <- auto.arima(US.Sales.expense.Data.TS[,var], d = 1, 
+                               seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+#print model
+passenger.vehix.arima.1
+
+#forecast model
+fcast.passenger.vehix.arima.1 <- forecast(passenger.vehix.arima.1, h = 12)
+
+plot <- autoplot(fcast.passenger.vehix.arima.1, series="Forecast") +
+    autolayer(passenger.vehix.arima.1$fitted, series="Forecast Model") +
+    autolayer(US.Sales.expense.Data.TS[,var], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast field equip", i, sep = " "))
+  
+print(plot)
+checkresiduals(passenger.vehix.arima.1)
+```
+
+```{r Total Rolling Stock, echo=FALSE}
+#variable to sup into code
+var = 5
+
+autoplot(US.Sales.expense.Data.TS[,var])
+
+#Delivery plant vehicle Acf
+ggAcf(US.Sales.expense.Data.TS[,var])
+#sig lag @1 with seasonal lag pattern
+
+#first diff 
+ggAcf(diff(US.Sales.expense.Data.TS[,var], lag = 1))
+#autocorr extracted
+
+#plot diffed data
+autoplot(diff(US.Sales.expense.Data.TS[,var], lag = 1))
+
+#take seasonal difference
+ggAcf(diff(US.Sales.expense.Data.TS[,var], lag = 12))
+#plot seasonal diff
+autoplot(diff(US.Sales.expense.Data.TS[,var], lag = 12))
+
+#try double diff
+ggAcf(diff(diff(US.Sales.expense.Data.TS[,var], lag = 1), lag = 12))
+#go with seasonal diff only 
+
+
+#build arima model
+roll.stock.arima.1 <- auto.arima(US.Sales.expense.Data.TS[,var], D = 1, 
+                               seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+#print model
+roll.stock.arima.1
+
+#forecast model
+fcast.roll.stock.arima.1 <- forecast(roll.stock.arima.1, h = 12)
+
+plot <- autoplot(fcast.roll.stock.arima.1, series="Forecast") +
+    autolayer(roll.stock.arima.1$fitted, series="Forecast Model") +
+    autolayer(US.Sales.expense.Data.TS[,var], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast field equip", i, sep = " "))
+  
+print(plot)
+checkresiduals(passenger.vehix.arima.1)
+```

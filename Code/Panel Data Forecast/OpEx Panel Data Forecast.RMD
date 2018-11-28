@@ -1,0 +1,151 @@
+---
+title: "OPEX Forecast Panel Data"
+author: "Jason Marshall"
+date: "November 7, 2018"
+output: word_document
+---
+#Build analytical models to forecast rolling stock totals using cross sectional data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libs, include=FALSE, echo=FALSE, include = FALSE}
+library(forecast) #time series forecast
+library(tidyquant)
+library(timetk) #edit time serices objects
+library(sweep) #tidy model outputs
+library(tidyverse) #tidy data
+library(broom) #tidy ts model outputs
+library(timeDate) #edit ts objects
+library(reshape2) #shape data
+library(data.table) #shape data setDT
+library(readr) #data inport
+library(corrr)      # Tidy correlation tables and correlation plotting
+library(cowplot)    # Multiple plots with plot_grid()
+library(tseries) #adf.test
+library(astsa) #lag plot
+library(TSA)
+#library(DataExplorer) #exploratory data analysis
+#library(Hmisc)
+#library(caret) #model building
+library(quantreg) #quantile regression
+library(GGally)
+```
+
+```{r load expense data from above code chunk, echo=FALSE}
+####################################################################################
+expense.dataset <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/rolling.stock.focus/US.Rolling.Stock.Expense.csv", 
+    col_types = cols(Amount = col_number()))
+
+# make unique col names
+ colsNamesShelf <-colnames(expense.dataset)
+ dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+ colnames(expense.dataset) <- dataset_col_names
+ 
+#edit Division name
+  expense.dataset$Division <- gsub(" - ", "_", expense.dataset$Division)
+  expense.dataset$Division <- gsub(" ", "_", expense.dataset$Division)
+
+#add date column
+ expense.dataset <- expense.dataset %>%
+   #add day 01 just to get a complete date
+   mutate(day.holder = 01) %>%
+   #add year and month
+   mutate(date.holder = paste(Year, Acct.Per, day.holder, sep = "-"))
+
+#set date.holder as date
+ expense.dataset$date.holder <- as.Date(expense.dataset$date.holder)
+
+# #get last day of the month
+ expense.dataset$Date <- as.Date(timeDate::timeLastDayInMonth(expense.dataset$date.holder))
+
+#Filter closed, wholesale, terminal, DC divisions
+expense.dataset <- expense.dataset %>% 
+  filter(str_detect(Division, "Admin") == FALSE) %>% 
+  filter(str_detect(Division, "Closed") == FALSE) %>%
+  filter(str_detect(Division, "DC") == FALSE) %>%
+  filter(str_detect(Division, "Distribution") == FALSE) %>%
+  filter(str_detect(Division, "Wholesale") == FALSE) %>%
+  filter(str_detect(Division, "Terminals") == FALSE) %>%
+  filter(str_detect(Division, "Terminal") == FALSE)
+
+#change strings to factors
+expense.dataset <- expense.dataset %>% mutate_if(is.character, as.factor)
+
+#unit test
+#unique(expense.dataset$Division)
+levels(expense.dataset$Division)
+
+#summary check
+summary(expense.dataset)
+
+#fill NAs
+#expense.dataset %>% filter(is.na(Amount))
+expense.dataset$Amount <- replace_na(expense.dataset$Amount, 0)
+
+#summary check
+expense.dataset %>% group_by(Division) %>% summarise(sum = sum(Amount))
+#summary(expense.dataset)
+
+#create crosse sectional data
+cross.sect.expense.dataset <- expense.dataset %>%
+  group_by(Summary.Account, Parent.Account, Account, Geography, Region, Division, Year) %>%
+  summarise(sum = sum(Amount)) %>%
+  #spread data
+  spread(key = Account, value = sum) %>%
+  mutate(key = paste(Division, Year, sep = "_"))
+```
+
+```{r add sales data, echo=FALSE}
+US.Sales.Data <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US_Region_Division_Added_Only_NA_Item_Sales_chopdown_test a557ef9eb.csv")
+
+# #make unique col names
+colsNamesShelf <-colnames(US.Sales.Data)
+dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+colnames(US.Sales.Data) <- dataset_col_names
+
+#edit Division name
+  US.Sales.Data$Division <- gsub(" - ", "_", US.Sales.Data$Division)
+  US.Sales.Data$Division <- gsub(" ", "_", expense.dataset$Division)
+
+#edit date format 
+US.Sales.Data$Invoice.Date <- as.Date(US.Sales.Data$Invoice.Date, format = '%B %d, %Y')
+
+#change invoice date to last month of the year for monthly sum and join with expense data
+US.Sales.Data$Invoice.Date <- timeLastDayInMonth(US.Sales.Data$Invoice.Date)
+
+#get year from date
+US.Sales.Data$YEAR <- lubridate::year(US.Sales.Data$Invoice.Date)
+
+#create cross-sectional data
+
+#use dcast
+colnames(cross.sect.sales)
+cross.sect.sales <- US.Sales.Data %>% 
+  select(c(-Total.Margin, -Invoice.Date)) %>% 
+  mutate(id = 1:n()) %>%
+  mutate(key = paste(Division, YEAR, sep = "_")) %>%
+  spread(key = GL.Shelf, value = Net.Sales) %>%
+  replace(is.na(.), 0) %>%
+  group_by("Region","Region.Number", "Division", "Divsion.Number", "YEAR") %>%
+  summarise(sumAPPL = sum("APPL"))
+
+colnames(cross.sect.sales)  
+  
+    
+```
+
+```{r join data, echo=FALSE}
+full.data <- dplyr::inner_join(x = cross.sect.expense.dataset, y = cross.sect.sales, by = "key")
+
+
+
+```
+
+
+
+
+
+
+

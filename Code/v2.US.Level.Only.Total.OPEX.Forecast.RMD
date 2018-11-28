@@ -1,0 +1,402 @@
+---
+title: "v2.US.Level.Only.Total.OPEX.Forecast"
+author: "Jason Marshall"
+date: "August 15, 2018"
+output: word_document
+---
+
+Version 2: Code clean up / Analysis Focus Clean Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libs, include=FALSE, echo=FALSE}
+library(forecast) #time series forecast
+library(tidyquant)
+library(timetk) #edit time serices objects
+library(sweep) #tidy model outputs
+library(tidyverse) #tidy data
+library(broom) #tidy ts model outputs
+library(timeDate) #edit ts objects
+library(reshape2) #shape data
+library(data.table) #shape data setDT
+library(readr) #data inport
+#library(DataExplorer) #exploratory data analysis
+#library(Hmisc)
+#library(caret) #model building
+#library(quantreg) #quantile regression
+```
+
+```{r load and union expense data, echo=FALSE}
+# #load expense data
+# dataset.1 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - South.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.2 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - US.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.3 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - WCBT.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.4 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - West.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.5 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - CCBT.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.6 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - East.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.7 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - ECBT.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# #combine both datasets
+# comb.dataset <- bind_rows(dataset.1, dataset.2, dataset.3, dataset.4, dataset.5, dataset.6, dataset.7)
+# 
+# #fill NA
+# comb.dataset$Amount <- replace_na(comb.dataset$Amount, replace = 0)
+# 
+# #make unique col names
+# colsNamesShelf <-colnames(comb.dataset)
+# dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+# colnames(comb.dataset) <- dataset_col_names
+# 
+# #add date column
+# comb.dataset <- comb.dataset %>%
+#   mutate(day.holder = 01) %>%
+#   mutate(date.holder = paste(Year, Acct.Per, day.holder, sep = "-"))
+# 
+# #set date.holder as date
+# comb.dataset$date.holder <- as.Date(comb.dataset$date.holder)
+# 
+# #get last day of the month
+# comb.dataset$Date <- as.Date(timeDate::timeLastDayInMonth(comb.dataset$date.holder))
+# 
+# #write to disk
+# write.csv(comb.dataset,"Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US.opex.test.full.csv")
+```
+
+```{r load expense data from above code chunk, echo=FALSE}
+####################################################################################
+expense.dataset <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US.opex.test.full.csv")
+
+
+#Filter closed, wholesale, terminal, DC divisions
+expense.dataset <- expense.dataset %>% 
+  filter(str_detect(Division, "Admin") == FALSE) %>% 
+  filter(str_detect(Division, "Closed") == FALSE) %>%
+  filter(str_detect(Division, "DC") == FALSE) %>%
+  filter(str_detect(Division, "Distribution") == FALSE) %>%
+  filter(str_detect(Division, "Wholesale") == FALSE) %>%
+  filter(str_detect(Division, "Terminals") == FALSE) %>%
+  filter(str_detect(Division, "Terminal") == FALSE)
+
+#change strings to factors
+expense.dataset <- expense.dataset %>% mutate_if(is.character, as.factor)
+
+#unit test
+#unique(expense.dataset$Division)
+levels(expense.dataset$Division)
+
+
+
+#summary check
+summary(expense.dataset)
+
+#fill NAs
+#expense.dataset %>% filter(is.na(Amount))
+expense.dataset$Amount <- replace_na(expense.dataset$Amount, 0)
+
+#summary check
+expense.dataset %>% group_by(Division) %>% summarise(sum = sum(Amount))
+summary(expense.dataset)
+```
+
+##Summary of Data Set
+```{r create time series object: US Country Level, echo=FALSE}
+#subset down to US Total Sum
+US.Total.Expense.Dataset <- expense.dataset %>%
+  #group by US
+  group_by(Date, Parent.Account, Geography) %>%
+  #sum expense amounts
+  summarise(Expense.Sum = sum(Amount))
+
+summary(US.Total.Expense.Dataset)
+
+#unit test
+sum(expense.dataset$Amount) == sum(US.Total.Expense.Dataset$Expense.Sum)
+
+#make wide version
+US.Total.Expense.Dataset <- dcast(data.table::setDT(US.Total.Expense.Dataset), 
+                                     formula = Date + Geography ~ Parent.Account,
+                                     value.var = c("Expense.Sum"),
+                                     fun.aggregate = sum)
+#summary check
+#summary(US.Total.Expense.Dataset)
+
+#fill NAs 
+#US.Total.Expense.Dataset[is.na(US.Total.Expense.Dataset)] <- 0
+
+#sort oldest to newest
+US.Total.Expense.Dataset <- US.Total.Expense.Dataset[order(US.Total.Expense.Dataset$Date, decreasing = FALSE)]
+
+#create ts object drop first two cols (non-numeric)
+US.Total.Expense.Dataset.TS <- ts(data = US.Total.Expense.Dataset[,-c(1,2)], 
+                                     start = c(2013,01), frequency = 12)
+#Unit Test
+summary(US.Total.Expense.Dataset.TS)
+start(US.Total.Expense.Dataset.TS)
+end(US.Total.Expense.Dataset.TS)
+
+#drop other datasets to help with file size
+rm(expense.dataset)
+#rm(US.Total.Expense.Dataset)
+```
+
+#########################################
+##Time Series EDA
+#########################################
+```{r US.Total EDA autoplot, echo=FALSE}
+autoplot(US.Total.Expense.Dataset.TS)
+```
+
+##US.Total EDA loess plots
+```{r US.Total EDA loess plot, echo=FALSE}
+cols <- colnames(US.Total.Expense.Dataset.TS)
+
+#plot each column
+for (i in cols){
+   ts.plot <- autoplot(US.Total.Expense.Dataset.TS[,i]) +
+     geom_smooth(method = "loess") +
+     ggtitle(i)
+   print(ts.plot)
+}
+```
+
+##US.Total EDA loess plots (Drop/Smooth Outliers)
+```{r US.Total EDA loess plot remove outliers, echo=FALSE}
+cols <- colnames(US.Total.Expense.Dataset.TS)
+
+#plot each column
+for (i in cols){
+#tsclean() to remove outliers
+   ts.plot <- US.Total.Expense.Dataset.TS[,i] %>%
+     #tsclean() to smooth outliers
+     tsclean() %>% 
+     autoplot() +
+     geom_smooth(method = "loess") +
+     ggtitle(i)
+   print(ts.plot)
+}
+```
+
+##US.Total EDA Season Plots
+```{r US.Total EDA season plot, echo=FALSE}
+cols <- colnames(US.Total.Expense.Dataset.TS)
+#seasonplot each column
+for (i in cols){
+   season.plot <- ggseasonplot(US.Total.Expense.Dataset.TS[,i]) + 
+     ggtitle(i)
+   print(season.plot)
+}
+```
+
+
+
+
+##US.Total EDA Subseries plots
+```{r US.Total EDA subseason plot, echo=FALSE}
+cols <- colnames(US.Total.Expense.Dataset.TS)
+#season subseries plot each column
+for (i in cols){
+   sub.season.plot <- ggsubseriesplot(US.Total.Expense.Dataset.TS[,i]) + 
+     ggtitle(i)
+   print(sub.season.plot)
+}
+```
+
+##US.Total EDA Boxplots
+```{US Total EDA Boxplot, echo=FALSE}
+
+cols <- colnames(US.Total.Expense.Dataset.TS)
+#box plot each column
+for (i in cols){
+  box.plot <- boxplot(US.Total.Expense.Dataset.TS[,i] ~ cycle(US.Total.Expense.Dataset.TS[,i]), 
+                      main = paste("Box Plot:", i, sep = " "))
+  print(box.plot)
+  }
+
+```
+
+#decompose data (season/trend/cycle)
+```{r decomp, echo=FALSE}
+#Seasonal Decomposition of Time Series by Loess
+#Decompose a time series into seasonal, trend and irregular components using #loess, acronym STL.
+
+decomp <- stl(US.Total.Expense.Dataset.TS[,1], s.window = 'periodic')
+autoplot(decomp)
+
+deseasonal_ts <- seasadj(decomp)
+autoplot(deseasonal_ts)
+
+```
+
+
+
+#Stationize the data
+```{r test stationarity, echo=FALSE}
+#(lower pvalue better)
+sweep::sw_glance(tseries::adf.test(US.Total.Expense.Dataset.TS[,1]), alternative = "stationary")
+
+sweep::sw_glance(tseries::adf.test(diff(US.Total.Expense.Dataset.TS[,1])), alternative = "stationary")
+```
+
+#lag order
+```{r determine autocorrelation lag order, echo=FALSE}
+ggAcf(US.Total.Expense.Dataset.TS[,1])
+ggPacf(US.Total.Expense.Dataset.TS[,1])
+
+ggAcf(diff(US.Total.Expense.Dataset.TS[,1]))
+ggPacf(diff(US.Total.Expense.Dataset.TS[,1]))
+
+autoplot(diff(US.Total.Expense.Dataset.TS[,1], differences = 1))
+diff.data <- diff(US.Total.Expense.Dataset.TS[,1], differences = 1)
+tseries::adf.test(diff.data, alternative = "stationary")
+```
+
+#fit arima model
+```{r fit arima model, echo=FALSE}
+sweep::sw_tidy(auto.arima(diff.data, seasonal=TRUE))
+```
+
+
+```{r US.Total AFC plot, echo=FALSE}
+cols <- colnames(US.Total.Expense.Dataset.TS)
+#season subseries plot each column
+for (i in cols){
+   Acf.plot <- ggAcf(US.Total.Expense.Dataset.TS[,i], main = paste("ACF Plot:", i, sep = " "))
+   print(Acf.plot)
+}
+```
+
+```{r US.Total afc plot lag 12, echo = FALSE, message = FALSE }
+cols <- colnames(US.Total.Expense.Dataset.TS)
+#season subseries plot each column
+for (i in cols){
+   Acf.plot <- ggAcf(US.Total.Expense.Dataset.TS[,i], main = paste("ACF Plot lag = 12:", i, sep = " "), lag = 12)
+   print(Acf.plot)
+}
+```
+
+```{r US.Total AFC plot diff lag  12, echo = FALSE}
+cols <- colnames(US.Total.Expense.Dataset.TS)
+#season subseries plot each column
+for (i in cols){
+   Acf.plot <- ggAcf(diff(US.Total.Expense.Dataset.TS[,i],lag = 12), main = paste("ACF Plot dif(Lag = 12):", i, sep = " "))
+   print(Acf.plot)
+}
+```
+
+##Forecast Options
+##ETS outliers untreated
+```{r ets, echo=FALSE}
+cols <- colnames(US.Total.Expense.Dataset.TS)
+for (i in cols){
+  ets.1 <- ets(US.Total.Expense.Dataset.TS[,i])
+  #ets.1
+
+  fx.ets.1 <- forecast(ets.1, h = 12)
+  
+  sweep::sw_glance(ets.1)
+
+  plot <- autoplot(fx.ets.1, series="Forecast") +
+    autolayer(ets.1$fitted, series="Forecast Model") +
+    autolayer(US.Total.Expense.Dataset.TS[,i], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("Regression Forecast Test ETS", i, sep = " "))
+  
+  print(plot)
+}
+```
+
+```{r}
+
+```
+
+##ETS outliers treated
+```{r ets clean outliers, echo=FALSE}
+cols <- colnames(US.Total.Expense.Dataset.TS)
+for (i in cols){
+  ets.1 <- US.Total.Expense.Dataset.TS[,i] %>%
+    #input new values for outliers
+    tsclean() %>%
+    ets() 
+  #ets.1
+
+  fx.ets.1 <- forecast(ets.1, h = 12)
+
+  plot <- autoplot(fx.ets.1, series="Forecast") +
+    autolayer(ets.1$fitted, series="Forecast Model") +
+    autolayer(US.Total.Expense.Dataset.TS[,i], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("Regression Forecast Test ETS", i, sep = " "))
+  
+  print(plot)
+}
+```
+
+```{r holtwinters, echo=FALSE}
+# cols <- colnames(US.Total.Expense.Dataset.TS)
+# for (i in cols){
+#   model <- US.Total.Expense.Dataset.TS[,i] %>%
+#     #input new values for outliers
+#     tsclean() %>%
+#     HoltWinters()
+#   #ets.1
+# 
+#   fcst <- forecast(arima.1, h = 12)
+# 
+#   plot <- autoplot(fcst$mean, series="Forecast") +
+#     autolayer(model$fitted, series="Forecast Model") +
+#     autolayer(US.Total.Expense.Dataset.TS[,i], series = "Actuals") + 
+#     xlab("Year") + 
+#     ylab("Actuals") +
+#     ggtitle(paste("Regression Forecast Test Holt Winters", i, sep = " "))
+#   
+#   print(plot)
+# }
+```
+
+##ARIMA outliers untreated
+```{r ARIMA, echo=FALSE}
+cols <- colnames(US.Total.Expense.Dataset.TS)
+for (i in cols){
+  model <- US.Total.Expense.Dataset.TS[,i] %>%
+    #input new values for outliers
+    #tsclean() %>%
+    auto.arima(D = 1) 
+  #ets.1
+
+  fcst <- forecast(model, h = 12)
+
+  plot <- autoplot(fcst, series="Forecast") +
+    autolayer(model$fitted, series="Forecast Model") +
+    autolayer(US.Total.Expense.Dataset.TS[,i], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("Regression Forecast Test AUTO.ARIMA", i, sep = " "))
+  
+  print(plot)
+}
+```
+
+
+
+
+
+
+
+

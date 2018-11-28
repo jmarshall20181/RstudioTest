@@ -1,0 +1,1379 @@
+---
+title: "OPEX_Forecast.Rolling.Stock.Focus"
+author: "Jason Marshall"
+date: "August 20, 2018"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libs, include=FALSE, echo=FALSE, include = FALSE}
+library(forecast) #time series forecast
+library(tidyquant)
+library(timetk) #edit time serices objects
+library(sweep) #tidy model outputs
+library(tidyverse) #tidy data
+library(broom) #tidy ts model outputs
+library(timeDate) #edit ts objects
+library(reshape2) #shape data
+library(data.table) #shape data setDT
+library(readr) #data inport
+library(corrr)      # Tidy correlation tables and correlation plotting
+library(cowplot)    # Multiple plots with plot_grid()
+library(tseries) #adf.test
+library(astsa) #lag plot
+library(TSA)
+#library(DataExplorer) #exploratory data analysis
+#library(Hmisc)
+#library(caret) #model building
+library(quantreg) #quantile regression
+library(GGally)
+```
+
+```{r load expense data from above code chunk, echo=FALSE}
+####################################################################################
+#load expense data set
+expense.dataset <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US.opex.test.full.csv")
+
+#Filter closed, wholesale, terminal, DC divisions
+expense.dataset <- expense.dataset %>% 
+  filter(str_detect(Division, "Admin") == FALSE) %>% 
+  filter(str_detect(Division, "Closed") == FALSE) %>%
+  filter(str_detect(Division, "DC") == FALSE) %>%
+  filter(str_detect(Division, "Distribution") == FALSE) %>%
+  filter(str_detect(Division, "Wholesale") == FALSE) %>%
+  filter(str_detect(Division, "Terminals") == FALSE) %>%
+  filter(str_detect(Division, "Terminal") == FALSE)
+
+#change strings to factors
+expense.dataset <- expense.dataset %>% mutate_if(is.character, as.factor)
+
+#unit test
+#unique(expense.dataset$Division)
+levels(expense.dataset$Division)
+
+#summary check
+#summary(expense.dataset)
+
+#fill NAs
+#expense.dataset %>% filter(is.na(Amount))
+expense.dataset$Amount <- replace_na(expense.dataset$Amount, 0)
+
+#summary check
+#expense.dataset %>% group_by(Division) %>% summarise(sum = sum(Amount))
+#summary(expense.dataset)
+```
+
+```{r create time series object: US Country Level, echo=FALSE}
+#subset down to US Total Sum
+US.Total.Expense.Dataset <- expense.dataset %>%
+  #group by date account (lower levels) and geography
+  group_by(Date, Account, Geography) %>%
+  #sum expense amounts
+  summarise(Expense.Sum = sum(Amount))
+
+summary(US.Total.Expense.Dataset)
+
+#unit test
+sum(expense.dataset$Amount) == sum(US.Total.Expense.Dataset$Expense.Sum)
+
+#make wide version at US Country level
+US.Total.Expense.Dataset <- dcast(data.table::setDT(US.Total.Expense.Dataset), 
+                                     formula = Date + Geography ~ Account,
+                                     value.var = c("Expense.Sum"),
+                                     fun.aggregate = sum)
+#summary check
+#summary(US.Total.Expense.Dataset)
+
+#fill NAs 
+#US.Total.Expense.Dataset[is.na(US.Total.Expense.Dataset)] <- 0
+
+#sort oldest to newest
+US.Total.Expense.Dataset <- US.Total.Expense.Dataset %>%
+  arrange(Date)
+
+#create ts object drop first two cols (non-numeric)
+US.Total.Expense.Dataset.TS <- timetk::tk_xts(data = US.Total.Expense.Dataset,
+                                              select = -c(Geography),
+                                              date_var = Date)
+#Unit Test
+#summary(US.Total.Expense.Dataset.TS)
+start(US.Total.Expense.Dataset.TS)
+end(US.Total.Expense.Dataset.TS)
+
+#drop other datasets to help with file size
+rm(expense.dataset)
+#rm(US.Total.Expense.Dataset)
+```
+
+```{r filter data set to just rolling stock, echo=FALSE}
+#focus analysis on rolling stock
+US.Total.Expense.Dataset.roll.stock <- US.Total.Expense.Dataset[,c('Date', 'Geography', 'ROLLING_STOCK')]
+
+#create ts object drop first two cols (non-numeric)
+US.Total.Expense.Dataset.roll.stock.TS <- ts(data = US.Total.Expense.Dataset.roll.stock[,-c(1,2)], 
+                                     start = c(2013,01), frequency = 12)
+
+#cut data set down to 2014 to match sales data
+US.Total.Expense.Dataset.roll.stock.TS <- window(US.Total.Expense.Dataset.roll.stock.TS, start = c(2014,1))
+
+#US.Total.Expense.Dataset.roll.stock.TS
+```
+
+##################
+```{r add sales data, echo=FALSE}
+US.Sales.Data <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US_Region_Division_Added_Only_NA_Item_Sales_chopdown_test a557ef9eb.csv")
+
+# #make unique col names
+colsNamesShelf <-colnames(US.Sales.Data)
+dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+colnames(US.Sales.Data) <- dataset_col_names
+
+#edit date format 
+US.Sales.Data$Invoice.Date <- as.Date(US.Sales.Data$Invoice.Date, format = '%B %d, %Y')
+
+#change invoice date to last month of the year for monthly sum and join with expense data
+US.Sales.Data$Invoice.Date <- timeLastDayInMonth(US.Sales.Data$Invoice.Date) 
+
+#change to character to facilitate group_by below
+US.Sales.Data$Invoice.Date <- as.character(US.Sales.Data$Invoice.Date)
+```
+
+```{r shape sales data, echo=FALSE}
+#Sum net sales and total margin
+US.Sales.Data.cutdown <- US.Sales.Data %>%
+  #Select Data
+  dplyr::select(Invoice.Date, GL.Shelf, Net.Sales, Total.Margin) %>%
+  dplyr::group_by(Invoice.Date, GL.Shelf) %>% 
+  dplyr::summarise(Net.Sales = sum(Net.Sales), Total.Margin = sum(Total.Margin))
+  
+#unit test
+sum(US.Sales.Data$Net.Sales) == sum(US.Sales.Data.cutdown$Net.Sales)
+sum(US.Sales.Data$Total.Margin) == sum(US.Sales.Data.cutdown$Total.Margin)
+```
+
+```{r US Sales Time Series, echo=FALSE}
+#convert us.sales.data.cutdown to date for sort
+US.Sales.Data$Invoice.Date <- as.Date(US.Sales.Data$Invoice.Date)
+#sort by date
+US.Sales.Data$Invoice.Date <- sort(US.Sales.Data$Invoice.Date, decreasing = FALSE)
+
+#start to create ts object
+US.Sales.Data.TS <- US.Sales.Data %>%
+  dplyr::select(Invoice.Date, GL.Shelf, Net.Sales, Total.Margin)
+
+#create wide version of data
+US.Sales.Data.TS <- dcast(data = data.table::setDT(US.Sales.Data.TS), 
+                                  formula = Invoice.Date ~ GL.Shelf,
+                                  value.var = c('Net.Sales', 'Total.Margin'),
+                                  fun.aggregate = sum) %>%
+  mutate(Net.Sales_Total = (Net.Sales_APPL + Net.Sales_CHEM + Net.Sales_FERT + Net.Sales_OTHE + Net.Sales_SEED)) %>%
+  mutate(Total.Margin_Total = (Total.Margin_APPL + Total.Margin_CHEM + Total.Margin_FERT + Total.Margin_OTHE + Total.Margin_SEED))
+
+#add total sum columns for net.sales and total.margin
+US.Sales.Data.TS <- US.Sales.Data.TS
+
+#convert to ts object
+US.Sales.Data.TS <- timetk::tk_ts_(US.Sales.Data.TS, start = c(2014,1), frequency = 12)
+
+#join ts objects
+US.Sales.ExpenseData.TS <- ts.intersect(US.Total.Expense.Dataset.roll.stock.TS, US.Sales.Data.TS)
+
+#drop used data sets to save space
+rm(US.Total.Expense.Dataset)
+rm(US.Total.Expense.Dataset.roll.stock.TS)
+rm(US.Total.Expense.Dataset.TS)
+rm(US.Total.Expense.Dataset.roll.stock)
+rm(US.Sales.Data)
+rm(US.Sales.Data.TS)
+rm(US.Sales.Data.cutdown)
+```
+
+##Time Series EDA
+```{r plot variables against rolling stock, echo=FALSE}
+cols <- colnames(US.Sales.ExpenseData.TS)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(US.Sales.ExpenseData.TS[,c(1,i)]) + 
+    ggtitle(paste("Rolling Stock vs", cols[i], sep = " "))
+  print(data.plot)
+}
+```
+
+```{r Season Plot for each variable, include= TRUE, echo=FALSE}
+cols <- colnames(US.Sales.ExpenseData.TS)
+
+for (i in cols){
+  data.plot <- ggseasonplot(US.Sales.ExpenseData.TS[,i]) +
+    ggtitle(paste("Season Plot:", i, sep = " "))
+  
+  print(data.plot)
+}
+```
+
+```{r sub Season Plot for each variable}
+cols <- colnames(US.Sales.ExpenseData.TS)
+
+for (i in cols){
+  data.plot <- ggsubseriesplot(US.Sales.ExpenseData.TS[,i]) +
+    ggtitle(paste("Subseries Plot:", i, sep = " "))
+  
+  print(data.plot)
+}
+
+?`[`
+
+```
+
+```{r Box  Plot for each variable, echo=FALSE}
+cols <- colnames(US.Sales.ExpenseData.TS)
+
+for (i in cols){
+  box.plot <- boxplot(US.Sales.ExpenseData.TS[,i] ~ cycle(US.Sales.ExpenseData.TS[,i]), 
+                      main = paste("Box Plot:", i, sep = " "))
+  print(box.plot)
+  }
+```
+
+#decompose data (season/trend/cycle)
+```{r decomp, echo=FALSE, include = FALSE}
+# #Seasonal Decomposition of Time Series by Loess
+# #Decompose a time series into seasonal, trend and irregular components using #loess, acronym STL.
+# 
+# decomp <- stl(US.Sales.ExpenseData.TS[,1], s.window = 'periodic')
+# autoplot(decomp, title = (paste("TS Decomp", i, sep = " "))) 
+# 
+# deseasonal_ts <- seasadj(decomp)
+# autoplot(deseasonal_ts)
+```
+
+```{r test for stationarity rolling stock, echo = FALSE, include=FALSE}
+#create xts object for editing
+US.Total.Expense.Dataset.roll.stock.xts <- as.xts(US.Roll.Stock.Sales.TS)
+#na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset..roll.stock.TS,1))
+
+#rolling stock
+autoplot(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset.roll.stock.TS)
+ggAcf(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset.roll.stock.TS)
+ggAcf(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset.roll.stock.TS,12))
+adf.test(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset.roll.stock.TS)
+#higher than .05 non stationary
+#kpss test for trend stationarity
+kpss.test(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset.roll.stock.TS)
+#trend stationary @ .1 assume non-stationary basd on adf test
+
+#diff data
+autoplot(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset.roll.stock.TS, 12))
+adf.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset.roll.stock.TS,12)))
+#below than .05 stationary
+
+#kpss test for trend stationarity
+kpss.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset.roll.stock.TS,12)))
+#trend stationary @ .1 approx stationary basd on adf test
+
+#acf plot
+ggPacf(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset.roll.stock.TS)
+ggAcf(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset.roll.stock.TS,12)))
+```
+
+```{r test for stationarity APPL Sales, echo = FALSE, include=FALSE}
+# US.Total.Expense.Dataset.roll.stock.xts <- as.xts(US.Roll.Stock.Sales.TS)
+# #na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset..roll.stock.TS,1))
+# 
+# #rolling stock
+# autoplot(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_APPL)
+# ggAcf(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_APPL)
+# adf.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_APPL)
+# #pvalue lower than .05 fail to accept the null
+# 
+# #kpss test for trend stationarity
+# kpss.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_APPL)
+# #trend stationary @ .1 assume non-stationary basd on adf test
+# 
+# #acf plot 
+# ggAcf((US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_APPL))
+# #try seasonal diff for seasonal plots
+# 
+# #diff data
+# autoplot(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_APPL, 12))
+# adf.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_APPL,12)))
+# #below than .05 stationary
+# 
+# #kpss test for trend stationarity
+# kpss.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_APPL,12)))
+# #trend stationary @ .1 approx stationary basd on adf test
+# 
+# #acf plot 
+# ggAcf(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_APPL,12)))
+```
+
+```{r test for stationarity CHEM Sales, echo = FALSE, include=FALSE}
+# #create xts object for editing
+# #US.Total.Expense.Dataset.roll.stock.xts <- as.xts(US.Roll.Stock.Sales.TS)
+# #na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset..roll.stock.TS,1))
+# 
+# #rolling stock
+# autoplot(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_CHEM)
+# ggAcf(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_CHEM)
+# adf.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_CHEM)
+# #pvalue lower than .05 fail to accept the null
+# 
+# #kpss test for trend stationarity
+# kpss.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_CHEM)
+# #trend stationary @ .1 assume non-stationary basd on adf test
+# 
+# #acf plot 
+# ggAcf((US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_CHEM))
+# #try seasonal diff for seasonal plots
+# 
+# #diff data
+# autoplot(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_CHEM, 12))
+# adf.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_CHEM,12)))
+# #below than .05 stationary
+# 
+# #kpss test for trend stationarity
+# kpss.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_CHEM,12)))
+# #trend stationary @ .1 approx stationary basd on adf test
+# 
+# #acf plot 
+# ggAcf(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_CHEM,12)))
+```
+
+```{r test for stationarity FERT Sales, echo = FALSE, include=FALSE}
+# #create xts object for editing
+# #US.Total.Expense.Dataset.roll.stock.xts <- as.xts(US.Roll.Stock.Sales.TS)
+# #na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset..roll.stock.TS,1))
+# 
+# #rolling stock
+# autoplot(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_FERT)
+# ggAcf(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_FERT)
+# adf.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_FERT)
+# #pvalue lower than .05 fail to accept the null
+# 
+# #kpss test for trend stationarity
+# kpss.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_FERT)
+# #trend stationary @ .1 assume non-stationary basd on adf test
+# 
+# #acf plot 
+# ggAcf((US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_FERT))
+# #try seasonal diff for seasonal plots
+# 
+# #diff data
+# autoplot(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_FERT, 12))
+# adf.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_FERT,12)))
+# #below than .05 stationary
+# 
+# #kpss test for trend stationarity
+# kpss.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_FERT,12)))
+# #trend stationary @ .1 approx stationary basd on adf test
+# 
+# #acf plot 
+# ggAcf(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_FERT,12)))
+```
+
+```{r test for stationarity OTHER Sales, echo = FALSE, include=FALSE}
+# #create xts object for editing
+# #US.Total.Expense.Dataset.roll.stock.xts <- as.xts(US.Roll.Stock.Sales.TS)
+# #na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset..roll.stock.TS,1))
+# 
+# #rolling stock
+# autoplot(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_OTHE)
+# ggAcf(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_OTHE)
+# adf.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_OTHE)
+# #pvalue lower than .05 fail to accept the null
+# 
+# #kpss test for trend stationarity
+# kpss.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_OTHE)
+# #trend stationary @ .1 assume non-stationary basd on adf test
+# 
+# #acf plot 
+# ggAcf((US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_OTHE))
+# #try seasonal diff for seasonal plots
+# 
+# #diff data
+# autoplot(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_OTHE, 12))
+# adf.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_OTHE,12)))
+# #below than .05 stationary
+# 
+# #kpss test for trend stationarity
+# kpss.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_OTHE,12)))
+# #trend stationary @ .1 approx stationary basd on adf test
+# 
+# #acf plot 
+# ggAcf(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_OTHE,12)))
+```
+
+```{r test for stationarity SEED Sales, echo = FALSE, include=FALSE}
+# #create xts object for editing
+# #US.Total.Expense.Dataset.roll.stock.xts <- as.xts(US.Roll.Stock.Sales.TS)
+# #na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset..roll.stock.TS,1))
+# 
+# #rolling stock
+# autoplot(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_SEED)
+# ggAcf(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_SEED)
+# adf.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_SEED)
+# #pvalue lower than .05 fail to accept the null
+# 
+# #kpss test for trend stationarity
+# kpss.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_SEED)
+# #trend stationary @ .1 assume non-stationary basd on adf test
+# 
+# #acf plot
+# ggAcf((US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_SEED))
+# #try seasonal diff for seasonal plots
+# 
+# #diff data
+# autoplot(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_SEED, 12))
+# adf.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_SEED,12)))
+# #below than .05 stationary
+# 
+# #kpss test for trend stationarity
+# kpss.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_SEED,12)))
+# #trend stationary @ .1 approx stationary basd on adf test
+# 
+# #acf plot
+# ggAcf(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_SEED,12)))
+```
+
+```{r test for stationarity Total Sales, echo = FALSE, include=FALSE}
+# #create xts object for editing
+# #US.Total.Expense.Dataset.roll.stock.xts <- as.xts(US.Roll.Stock.Sales.TS)
+# #na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Total.Expense.Dataset..roll.stock.TS,1))
+# 
+# #rolling stock
+# autoplot(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_Total)
+# ggAcf(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_Total)
+# adf.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_Total)
+# #pvalue lower than .05 fail to accept the null
+# 
+# #kpss test for trend stationarity
+# kpss.test(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_Total)
+# #trend stationary @ .1 assume non-stationary basd on adf test
+# 
+# #acf plot
+# ggAcf((US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_Total))
+# #try seasonal diff for seasonal plots
+# 
+# #diff data
+# autoplot(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_Total, 12))
+# adf.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_Total,12)))
+# #below than .05 stationary
+# 
+# #kpss test for trend stationarity
+# kpss.test(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_Total,12)))
+# #trend stationary @ .1 approx stationary basd on adf test
+# 
+# #acf plot
+# ggAcf(na.omit(diff(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_Total,12)))
+# 
+# ggPacf(US.Total.Expense.Dataset.roll.stock.xts$US.Sales.Data.cutdown.TS.Net.Sales_Total)
+
+```
+
+```{r rolling stock to sales scatter plots, echo=FALSE}
+cols <- colnames(US.Sales.ExpenseData.TS)
+#cols
+#i
+  dataset.tbl <-  US.Sales.ExpenseData.TS %>%
+  timetk::tk_tbl() %>% 
+  setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+           "marg.appl", "marg.chem", "margin.fert", "margin.other", "margin.seed", "total.sales", "total.marg"))
+  
+for (i in 2: length(cols)){
+  #print(i)
+  #print(colnames(US.Total.Expense.Dataset.roll.stock.xts[,i]))
+  # dataset.tbl <-  US.Total.Expense.Dataset.roll.stock.xts %>%
+  # timetk::tk_tbl() %>% 
+  # setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+  #          "marg.appl", "marg.chem", "marg.fert", "marg.other", "marg.seed", "tot.sales", "tot.marg"))
+  #set x y variables
+  
+  x <- dataset.tbl[,i]
+  y <- dataset.tbl[,2]
+  
+  #create scatterplot for x/y variables 
+  scatter.plot <- ggplot2::ggplot(dataset.tbl[,c(2,i)],
+                                aes(x =x, y = y)) + 
+    geom_point() +
+    xlab(colnames(dataset.tbl[,i])) + 
+    ylab(colnames(dataset.tbl[,2])) + 
+    geom_smooth(method = 'lm') + 
+    geom_smooth(method = 'loess', color = 'red')
+  
+    print(scatter.plot)
+}
+```
+
+```{R correlations, echo = FALSE}
+#colnames(US.Total.Expense.Dataset.roll.stock.xts)
+
+ Correlations <- US.Sales.ExpenseData.TS %>%
+  timetk::tk_tbl() %>% 
+  setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+           "marg.appl", "marg.chem", "marg.fert", "marg.other", "marg.seed", "tot.sales", "tot.marg")) %>%
+  dplyr::select(roll.stock, sales.appl, sales.chem, sales.fert, sales.other, sales.seed) %>%
+  corrr::correlate() #%>%
+  #select(rowname, roll.stock, sales.appl, sales.chem, sales.fert, sales.other, sales.seed)
+print(Correlations)
+
+# #Network Plot
+# US.Total.Expense.Dataset.roll.stock.xts %>%
+#   timetk::tk_tbl() %>% 
+#   setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+#            "marg.appl", "marg.chem", "marg.fert", "marg.other", "marg.seed", "tot.sales", "tot.marg")) %>%
+#   dplyr::select(roll.stock, sales.appl, sales.chem, sales.fert, sales.other, sales.seed,
+#            marg.appl, marg.chem, marg.fert, marg.other, marg.seed, tot.sales, tot.marg ) %>%
+#   corrr::correlate() %>%
+#   network_plot(colours = c(palette_light()[[2]], "white", palette_light()[[4]]), legend = TRUE) +
+#     # labs(
+#     #     title = "Correlations of tidyverse Package Downloads to Total CRAN Downloads",
+#     #     subtitle = "Looking at January through June, tidyquant is a clear outlier"
+#     #     ) +
+#     expand_limits(x = c(-0.75, 0.25), y = c(-0.4, 0.4)) +
+#     theme_tq() +
+#     theme(legend.position = "bottom")
+```
+
+```{r rolling correlations chem to roll.stock, echo=FALSE, include =  FALSE}
+# US.Total.Expense.Dataset.roll.stock.xts %>%
+#   timetk::tk_tbl() %>% 
+#   setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+#            "marg.appl", "marg.chem", "marg.fert", "marg.other", "marg.seed", "tot.sales", "tot.marg")) %>%
+#   # dplyr::select(roll.stock, sales.appl, sales.chem, sales.fert, sales.other, sales.seed,
+#   #          marg.appl, marg.chem, marg.fert, marg.other, marg.seed, tot.sales, tot.marg ) %>%
+#    dplyr::select(index, roll.stock, sales.chem) %>%
+#   #mutation
+#   tq_mutate_xy(
+#     y = roll.stock,
+#     x = sales.chem,
+#     mutate_fun = runCor,
+#     n = 3,
+#     use = "pairwise.complete.obs",
+#     col_rename = "rolling_corr"
+#   ) %>%
+#   ggplot(aes(x = index)) + 
+#   geom_line(aes(y = rolling_corr), color = "red") + 
+#   ggtitle("Rolling Correlations: Rolling Stock to Sales.Chem")
+```
+
+#cross correlation plots
+```{r cross correlation plots, echo=FALSE}
+# #RS to APPL
+# print("CCF Rolling Stock to APPL")
+# ggCcf(diff(US.Roll.Stock.Sales.TS[,1], 12),
+# diff(US.Roll.Stock.Sales.TS[,2], 12), main = "CCF Rolling Stock to APPL")
+# 
+# #RS to CHEM
+# print("CCF Rolling Stock to APPL")
+# ggCcf(US.Roll.Stock.Sales.TS[,1],
+# US.Roll.Stock.Sales.TS[,3], main = "CCF Rolling Stock to CHEM")
+# #add seasional lags
+# print("CCF Rolling Stock to APPL")
+# ggCcf(diff(US.Roll.Stock.Sales.TS[,1], 12),
+# diff(US.Roll.Stock.Sales.TS[,3], 12), main = "CCF Rolling Stock to CHEM seasonal Lag")
+# 
+# #RS to FERT
+# ggCcf(diff(US.Roll.Stock.Sales.TS[,1], 12),
+# diff(US.Roll.Stock.Sales.TS[,4], 12), main = "CCF Rolling Stock to CHEM")
+# 
+# #RS to OTHER
+# ggCcf(diff(US.Roll.Stock.Sales.TS[,1], 12),
+# diff(US.Roll.Stock.Sales.TS[,5], 12), main = "CCF Rolling Stock to OTHER")
+# 
+# #RS to SEED
+# ggCcf(diff(US.Roll.Stock.Sales.TS[,1], 12),
+# diff(US.Roll.Stock.Sales.TS[,6], 12), main = "CCF Rolling Stock to SEED")
+# 
+# #RS to Total Net Sales
+# #sales lag rolling stock
+# print("CCF: Rolling Stock to Net Sales")
+# ggCcf(diff(US.Roll.Stock.Sales.TS[,1], 12),
+# diff(US.Roll.Stock.Sales.TS[,12], 12))
+# 
+# #get max lag
+# RS.TotSales <- ggCcf(diff(US.Roll.Stock.Sales.TS[,1], 12),
+# diff(US.Roll.Stock.Sales.TS[,12], 12))
+# RS.TotSales
+# RS.TotSales$data
+# 
+# which.max(abs(RS.TotSales$data$ACF))
+# RS.TotSales$data[26,]
+# 
+# lag2.plot(diff(US.Roll.Stock.Sales.TS[,1], 12),
+# diff(US.Roll.Stock.Sales.TS[,12], 12),10)
+```
+
+```{r cross correlation plot loop, echo=FALSE}
+cols <- colnames(US.Sales.ExpenseData.TS)
+#cols
+
+#cross correlation for each variable with a seasonal difference for each variable
+for (i in 2:length(cols)){
+  #col <- colnames(US.Sales.ExpenseData.TS)[i]
+  RS.TotSales <- ggCcf(diff(US.Sales.ExpenseData.TS[,1], 12),
+  diff(US.Sales.ExpenseData.TS[,i], 12), main = paste("Rolling.Stock", cols[i], sep = ": "))
+  print(RS.TotSales)
+}
+```
+
+```{r rolling correlations chem to roll.stockx, echo=FALSE, include = FALSE}
+# US.Total.Expense.Dataset.roll.stock.xts %>%
+#   timetk::tk_tbl() %>% 
+#   setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+#            "marg.appl", "marg.chem", "marg.fert", "marg.other", "marg.seed", "tot.sales", "tot.marg")) %>%
+#   # dplyr::select(roll.stock, sales.appl, sales.chem, sales.fert, sales.other, sales.seed,
+#   #          marg.appl, marg.chem, marg.fert, marg.other, marg.seed, tot.sales, tot.marg ) %>%
+#    dplyr::select(index, roll.stock, sales.chem) %>%
+#   #mutation
+#   tq_mutate_xy(
+#     y = roll.stock,
+#     x = sales.chem,
+#     mutate_fun = runCor,
+#     n = 3,
+#     use = "pairwise.complete.obs",
+#     col_rename = "rolling_corr"
+#   ) %>%
+#   ggplot(aes(x = index)) + 
+#   geom_line(aes(y = rolling_corr), color = "red") + 
+#   ggtitle("Rolling Correlations: Rolling Stock to Sales.Chem")
+```
+
+```{r rolling correlations fert to roll.stock, echo=FALSE, include=FALSE}
+# US.Total.Expense.Dataset.roll.stock.xts %>%
+#   timetk::tk_tbl() %>% 
+#   setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+#            "marg.appl", "marg.chem", "marg.fert", "marg.other", "marg.seed", "tot.sales", "tot.marg")) %>%
+#   # dplyr::select(roll.stock, sales.appl, sales.chem, sales.fert, sales.other, sales.seed,
+#   #          marg.appl, marg.chem, marg.fert, marg.other, marg.seed, tot.sales, tot.marg ) %>%
+#    dplyr::select(index, roll.stock, sales.fert) %>%
+#   #mutation
+#   tq_mutate_xy(
+#     y = roll.stock,
+#     x = sales.fert,
+#     mutate_fun = runCor,
+#     n = 3,
+#     use = "pairwise.complete.obs",
+#     col_rename = "rolling_corr"
+#   ) %>%
+#   ggplot(aes(x = index)) + 
+#   geom_line(aes(y = rolling_corr), color = "red") + 
+#   ggtitle("Rolling Correlations: Rolling Stock to Sales.Chem")
+```
+
+```{r rolling correlations appl to roll.stock, echo=FALSE, include = FALSE}
+# US.Total.Expense.Dataset.roll.stock.xts %>%
+#   #ts.plot()
+#   timetk::tk_tbl() %>% 
+#   setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+#            "marg.appl", "marg.chem", "marg.fert", "marg.other", "marg.seed", "tot.sales", "tot.marg")) %>%
+#   # dplyr::select(roll.stock, sales.appl, sales.chem, sales.fert, sales.other, sales.seed,
+#   #          marg.appl, marg.chem, marg.fert, marg.other, marg.seed, tot.sales, tot.marg ) %>%
+#    dplyr::select(index, roll.stock, sales.appl) %>%
+#   ggplot(aes(x = index))
+# 
+# US.Total.Expense.Dataset.roll.stock.xts %>%
+#   timetk::tk_tbl() %>% 
+#   setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+#            "marg.appl", "marg.chem", "marg.fert", "marg.other", "marg.seed", "tot.sales", "tot.marg")) %>%
+#   # dplyr::select(roll.stock, sales.appl, sales.chem, sales.fert, sales.other, sales.seed,
+#   #          marg.appl, marg.chem, marg.fert, marg.other, marg.seed, tot.sales, tot.marg ) %>%
+#    dplyr::select(index, roll.stock, sales.appl) %>%
+#   #mutation
+#   tq_mutate_xy(
+#     y = roll.stock,
+#     x = sales.appl,
+#     mutate_fun = runCor,
+#     n = 3,
+#     use = "pairwise.complete.obs",
+#     col_rename = "rolling_corr"
+#   ) %>%
+#   ggplot(aes(x = index)) + 
+#   geom_line(aes(y = rolling_corr), color = "red") + 
+#   ggtitle("Rolling Correlations: Rolling Stock to Sales.Chem")
+```
+
+```{r rolling correlations fert to roll.stockx, echo=FALSE, include = FALSE}
+# US.Total.Expense.Dataset.roll.stock.xts[,c(1,13)] %>%
+#   ts.plot()
+#   #timetk::tk_tbl() %>% 
+#   setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+#            "marg.appl", "marg.chem", "marg.fert", "marg.other", "marg.seed", "tot.sales", "tot.marg")) %>%
+#   # dplyr::select(roll.stock, sales.appl, sales.chem, sales.fert, sales.other, sales.seed,
+#   #          marg.appl, marg.chem, marg.fert, marg.other, marg.seed, tot.sales, tot.marg ) %>%
+#    dplyr::select(index, roll.stock, tot.sales) %>%
+#   ggplot(aes)
+# 
+# 
+# US.Total.Expense.Dataset.roll.stock.xts %>%
+#   timetk::tk_tbl() %>% 
+#   setNames(.,c("index", "roll.stock", "sales.appl", "sales.chem", "sales.fert", "sales.other", "sales.seed",
+#            "marg.appl", "marg.chem", "marg.fert", "marg.other", "marg.seed", "tot.sales", "tot.marg")) %>%
+#   # dplyr::select(roll.stock, sales.appl, sales.chem, sales.fert, sales.other, sales.seed,
+#   #          marg.appl, marg.chem, marg.fert, marg.other, marg.seed, tot.sales, tot.marg ) %>%
+#    dplyr::select(index, roll.stock, tot.sales) %>%
+#   #mutation
+#   tq_mutate_xy(
+#     y = roll.stock,
+#     x = tot.sales,
+#     mutate_fun = runCor,
+#     n = 3,
+#     use = "pairwise.complete.obs",
+#     col_rename = "rolling_corr"
+#   ) %>%
+#   ggplot(aes(x = index)) + 
+#   geom_line(aes(y = rolling_corr), color = "red") + 
+#   ggtitle("Rolling Correlations: Rolling Stock to Sales.Chem")
+```
+
+##Linear Regression Model Roll Stock to Net Sales
+```{r #RS to sales to roll.stock Regression Testing, echo = FALSE}
+colnames(US.Sales.ExpenseData.TS)
+#create dataset
+ data <- US.Sales.ExpenseData.TS %>%
+  #convert to tibble
+  timetk::tk_tbl() %>%
+  #select variables
+  dplyr::select(index, US.Total.Expense.Dataset.roll.stock.TS, US.Sales.Data.TS.Net.Sales_Total) %>%
+  #add lagged variables
+  dplyr::mutate(saleslag.1 = lag(US.Sales.Data.TS.Net.Sales_Total, 1)) %>%
+  dplyr::mutate(saleslag.2 = lag(US.Sales.Data.TS.Net.Sales_Total, 2)) %>%
+  dplyr::mutate(saleslag.3 = lag(US.Sales.Data.TS.Net.Sales_Total, 3))
+  
+  #linear regression model
+  lag.model <- lm(US.Total.Expense.Dataset.roll.stock.TS ~ saleslag.1 + saleslag.2 + saleslag.3, data = data)
+  summary(lag.model)
+  
+  #Variable model
+  var.mod <- tslm(US.Sales.ExpenseData.TS[,1] ~ US.Sales.ExpenseData.TS[,12], data = US.Sales.ExpenseData.TS)
+  var.mod
+  summary(var.mod)
+  plot(var.mod)
+```
+
+##Linear Regression Model Roll Stock to APPL Sales
+```{r #RS to  APPL sales to roll.stock Regression Testing, echo = FALSE}
+#colnames(US.Sales.ExpenseData.TS)
+#create dataset
+ data <- US.Sales.ExpenseData.TS %>%
+  #convert to tibble
+  timetk::tk_tbl() %>%
+  #select variables
+  dplyr::select(index, US.Total.Expense.Dataset.roll.stock.TS, US.Sales.Data.TS.Net.Sales_APPL) %>%
+  #add lagged variables
+  dplyr::mutate(saleslag.1 = lag(US.Sales.Data.TS.Net.Sales_APPL, 1)) %>%
+  dplyr::mutate(saleslag.2 = lag(US.Sales.Data.TS.Net.Sales_APPL, 2)) %>%
+  dplyr::mutate(saleslag.3 = lag(US.Sales.Data.TS.Net.Sales_APPL, 3))
+  
+  #linear regression model
+  lag.model <- lm(US.Total.Expense.Dataset.roll.stock.TS ~ saleslag.1 + saleslag.2 + saleslag.3, data = data)
+  summary(lag.model)
+  
+  #Variable model
+  var.mod <- tslm(US.Sales.ExpenseData.TS[,1] ~ US.Sales.ExpenseData.TS[,2], data = US.Sales.ExpenseData.TS)
+  var.mod
+  summary(var.mod)
+  plot(var.mod)
+```
+
+##Linear Regression Model Roll Stock to Chem Sales
+```{r #RS to  CHEM sales to roll.stock Regression Testing, echo = FALSE}
+#colnames(US.Sales.ExpenseData.TS)
+#create dataset
+ data <- US.Sales.ExpenseData.TS %>%
+  #convert to tibble
+  timetk::tk_tbl() %>%
+  #select variables
+  dplyr::select(index, US.Total.Expense.Dataset.roll.stock.TS, US.Sales.Data.TS.Net.Sales_CHEM) %>%
+  #add lagged variables
+  dplyr::mutate(saleslag.1 = lag(US.Sales.Data.TS.Net.Sales_CHEM, 1)) %>%
+  dplyr::mutate(saleslag.2 = lag(US.Sales.Data.TS.Net.Sales_CHEM, 2)) %>%
+  dplyr::mutate(saleslag.3 = lag(US.Sales.Data.TS.Net.Sales_CHEM, 3))
+  
+  #linear regression model
+  lag.model <- lm(US.Total.Expense.Dataset.roll.stock.TS ~ saleslag.1 + saleslag.2 + saleslag.3, data = data)
+  summary(lag.model)
+  
+  #Variable model
+  var.mod <- tslm(US.Sales.ExpenseData.TS[,1] ~ US.Sales.ExpenseData.TS[,3], data = US.Sales.ExpenseData.TS)
+  var.mod
+  summary(var.mod)
+  plot(var.mod)
+```
+
+##Linear Regression Model Roll Stock to Fert Sales
+```{r #RS to  Fert sales to roll.stock Regression Testing, echo = FALSE}
+#colnames(US.Sales.ExpenseData.TS)
+#create dataset
+ data <- US.Sales.ExpenseData.TS %>%
+  #convert to tibble
+  timetk::tk_tbl() %>%
+  #select variables
+  dplyr::select(index, US.Total.Expense.Dataset.roll.stock.TS, US.Sales.Data.TS.Net.Sales_FERT) %>%
+  #add lagged variables
+  dplyr::mutate(saleslag.1 = lag(US.Sales.Data.TS.Net.Sales_FERT, 1)) %>%
+  dplyr::mutate(saleslag.2 = lag(US.Sales.Data.TS.Net.Sales_FERT, 2)) %>%
+  dplyr::mutate(saleslag.3 = lag(US.Sales.Data.TS.Net.Sales_FERT, 3))
+  
+  #linear regression model
+  lag.model <- lm(US.Total.Expense.Dataset.roll.stock.TS ~ saleslag.1 + saleslag.2 + saleslag.3, data = data)
+  summary(lag.model)
+  
+  #Variable model
+  var.mod <- tslm(US.Sales.ExpenseData.TS[,1] ~ US.Sales.ExpenseData.TS[,4], data = US.Sales.ExpenseData.TS)
+  var.mod
+  summary(var.mod)
+  plot(var.mod)
+```
+
+##Linear Regression Model Roll Stock to Seed Sales
+```{r #RS to  Seed sales to roll.stock Regression Testing, echo = FALSE}
+#colnames(US.Sales.ExpenseData.TS)
+#create dataset
+ data <- US.Sales.ExpenseData.TS %>%
+  #convert to tibble
+  timetk::tk_tbl() %>%
+  #select variables
+  dplyr::select(index, US.Total.Expense.Dataset.roll.stock.TS, US.Sales.Data.TS.Net.Sales_SEED) %>%
+  #add lagged variables
+  dplyr::mutate(saleslag.1 = lag(US.Sales.Data.TS.Net.Sales_SEED, 1)) %>%
+  dplyr::mutate(saleslag.2 = lag(US.Sales.Data.TS.Net.Sales_SEED, 2)) %>%
+  dplyr::mutate(saleslag.3 = lag(US.Sales.Data.TS.Net.Sales_SEED, 3))
+  
+  #linear regression model
+  lag.model <- lm(US.Total.Expense.Dataset.roll.stock.TS ~ saleslag.1 + saleslag.2 + saleslag.3, data = data)
+  summary(lag.model)
+  
+  #Variable model
+  var.mod <- tslm(US.Sales.ExpenseData.TS[,1] ~ US.Sales.ExpenseData.TS[,6], data = US.Sales.ExpenseData.TS)
+  var.mod
+  summary(var.mod)
+  plot(var.mod)
+```
+
+##Forecast external variables
+#APPL
+```{r build external model forecasts appl }
+colnames(US.Sales.ExpenseData.TS)[2]
+#chem
+ggAcf(US.Sales.ExpenseData.TS[,2])
+#seasonal lags
+ggAcf(base::diff(US.Sales.ExpenseData.TS[,2], lag = 12))
+
+#use 1 seasonal diff
+model.appl <- auto.arima(window(US.Sales.ExpenseData.TS[,2], end = c(2017,12)), D = 1, 
+                      approximation = FALSE, 
+                      stepwise = FALSE, seasonal = TRUE)
+
+fcast.appl <- forecast::forecast(model.appl, h = 12)
+
+plot <- autoplot(fcast.appl, series="Forecast") +
+    autolayer(model.appl$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,2], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast APPL Sales", i, sep = " "))
+  
+print(plot)
+```
+
+##ARIMA Model Roll Stock APPL as External Variable
+#Net Sales
+```{r build external model forecasts Net SALES }
+#chem
+ggAcf(US.Sales.ExpenseData.TS[,12])
+#seasonal lags
+ggAcf(base::diff(US.Sales.ExpenseData.TS[,12], lag = 12))
+
+#use 1 seasonal diff
+model.sales <- auto.arima(window(US.Sales.ExpenseData.TS[,12], end = c(2017,12)), D = 1, 
+                      approximation = FALSE, 
+                      stepwise = FALSE, seasonal = TRUE)
+
+fcast.sales <- forecast::forecast(model.sales, h = 12)
+
+plot <- autoplot(fcast.sales, series="Forecast") +
+    autolayer(model.sales$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,12], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast Net Sales", i, sep = " "))
+  
+print(plot)
+
+
+```
+
+##ARIMA Model CHEM
+```{r build external model forecasts chem }
+colnames(US.Sales.ExpenseData.TS)[3]
+#chem
+ggAcf(US.Sales.ExpenseData.TS[,3])
+#seasonal lags
+ggAcf(base::diff(US.Sales.ExpenseData.TS[,3], lag = 12))
+
+#use 1 seasonal diff
+model.chem <- auto.arima(window(US.Sales.ExpenseData.TS[,3], end = c(2017,12)), D = 1, 
+                      approximation = FALSE, 
+                      stepwise = FALSE, seasonal = TRUE)
+
+fcast.chem <- forecast::forecast(model.chem, h = 12)
+
+plot <- autoplot(fcast.chem, series="Forecast") +
+    autolayer(model.chem$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,3], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast CHEM Sales", i, sep = " "))
+  
+print(plot)
+```
+
+##ARIMA Model FERT
+```{r build external model forecasts fert }
+colnames(US.Sales.ExpenseData.TS)[4]
+
+#fert
+ggAcf(US.Sales.ExpenseData.TS[,4])
+#seasonal lags
+ggAcf(base::diff(US.Sales.ExpenseData.TS[,4], lag = 12))
+
+#use 1 seasonal diff
+model.fert <- auto.arima(window(US.Sales.ExpenseData.TS[,4], end = c(2017,12)), D = 1, 
+                      approximation = FALSE, 
+                      stepwise = FALSE, seasonal = TRUE)
+
+fcast.fert <- forecast::forecast(model.fert, h = 12)
+
+plot <- autoplot(fcast.fert, series="Forecast") +
+    autolayer(model.fert$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,4], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast fert Sales", i, sep = " "))
+  
+print(plot)
+```
+
+##ARIMA Model SEED
+```{r build external model forecasts seed }
+colnames(US.Sales.ExpenseData.TS)[6]
+#chem
+ggAcf(US.Sales.ExpenseData.TS[,6])
+#seasonal lags
+ggAcf(base::diff(US.Sales.ExpenseData.TS[,6], lag = 12))
+
+#use 1 seasonal diff
+model.seed <- auto.arima(window(US.Sales.ExpenseData.TS[,6], end = c(2017,12)), D = 1, 
+                      approximation = FALSE, 
+                      stepwise = FALSE, seasonal = TRUE)
+
+fcast.seed <- forecast::forecast(model.seed, h = 12)
+
+plot <- autoplot(fcast.seed, series="Forecast") +
+    autolayer(model.seed$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,6], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast SEED Sales", i, sep = " "))
+  
+print(plot)
+```
+
+##ARIMA Model NET SALES
+```{r build external model forecasts NetSALES, echo=FALSE }
+#chem
+ggAcf(US.Sales.ExpenseData.TS[,12])
+#seasonal lags
+ggAcf(base::diff(US.Sales.ExpenseData.TS[,12], lag = 12))
+
+#use 1 seasonal diff
+model.sales <- auto.arima(window(US.Sales.ExpenseData.TS[,12], end = c(2017,12)), D = 1, 
+                      approximation = FALSE, 
+                      stepwise = FALSE, seasonal = TRUE)
+
+fcast.sales <- forecast::forecast(model.sales, h = 12)
+
+plot <- autoplot(fcast.sales, series="Forecast") +
+    autolayer(model.sales$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,12], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast Net Sales", i, sep = " "))
+  
+print(plot)
+```
+
+#Forecast models with and without external variables
+```{r ARIMA model Test no external variables, echo=FALSE, include = FALSE}
+ARIMA.1 <- US.Sales.ExpenseData.TS[,1] %>%
+  #end training data at 2017 to show what 2018 would look like if we started from JAN
+  window(end = c(2017,12)) %>%
+  auto.arima(D = 1, approximation = FALSE, 
+             stepwise = FALSE, 
+             seasonal = TRUE)
+  
+#model parameters
+sw_tidy(ARIMA.1)
+#Accuracy Mesasures
+glance(ARIMA.1)
+#fitted and residuals
+sw_augment(ARIMA.1)
+checkresiduals(ARIMA.1)
+
+sw_augment(ARIMA.1) %>%
+    ggplot(aes(x = index, y = .resid)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_point(color = palette_light()[[1]], alpha = 0.5) +
+    geom_smooth(method = "loess") +
+    scale_x_yearmon(n = 3) +
+    labs(title = "Rolling Stock Forecast: ARIMA Residuals", x = "") + 
+    theme_tq()
+
+#forecast model
+fcast.ARIMA.1 <- forecast(ARIMA.1, h = 12)
+
+#fcast outputs
+sw_sweep(fcast.ARIMA.1, fitted = TRUE)
+
+
+plot <- autoplot(fcast.ARIMA.1, series="Forecast") +
+    autolayer(ARIMA.1$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,1], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast ROlling Stock Test No ExtVars", i, sep = " "))
+  
+  print(plot)
+  
+#Accuracy Mesasures
+Accuracy.df <- data.frame(matrix(NA, nrow = 6, ncol = 10))
+colnames(Accuracy.df) <- c("Model", "AIC", "BIC", "ME", "RMSE", "MAE", "MPE", "MAPE", "ACF1", "Theil's U")
+Accuracy.df[1,1] <- "No Xreg"
+Accuracy.df[1,2:3] <- glance(ARIMA.1)[3:4]
+Accuracy.df[1,4:10] <- accuracy(ARIMA.1$fitted, US.Sales.ExpenseData.TS[,1])
+```
+
+```{r linear model, echo=FALSE, include = FALSE}
+# autoplot(US.Sales.ExpenseData.TS[,c(1,13)])
+# 
+#  data <- window(US.Sales.ExpenseData.TS, end = c(2017,12))
+# 
+# reg.model <- tslm(data[,1] ~ data[,13],
+#                    data = data)
+# 
+# reg.model
+# #model parameters
+#   sw_tidy(reg.model)
+# #Accuracy Mesasures
+#   glance(reg.model)
+# #fitted and residuals
+#   sw_augment(reg.model)
+#   checkresiduals(reg.model)
+# 
+# sw_augment(reg.model) %>%
+#     ggplot(aes(x = index, y = .resid)) +
+#     geom_hline(yintercept = 0, color = "grey40") +
+#     geom_point(color = palette_light()[[1]], alpha = 0.5) +
+#     geom_smooth(method = "loess") +
+#     scale_x_yearmon(n = 4) +
+#     labs(title = "Rolling Stock Forecast: TSLM Residuals", x = "") + 
+#     theme_tq()
+
+```
+
+```{r ARIMA model Test sales.ext var, echo=FALSE, include=TRUE}
+ARIMA.2.sales.extvar <- US.Sales.ExpenseData.TS[,1] %>%
+  #end training data at 2017 to show what 2018 would look like if we started from JAN
+  window(end = c(2017,12)) %>%
+  auto.arima(D = 1, approximation = FALSE, 
+             stepwise = FALSE, 
+             seasonal = TRUE,
+             xreg = window(US.Sales.ExpenseData.TS[,12], end = c(2017,12)))
+  
+#model parameters
+sw_tidy(ARIMA.2.sales.extvar)
+#Accuracy Mesasures
+glance(ARIMA.2.sales.extvar)
+#fitted and residuals
+sw_augment(ARIMA.2.sales.extvar)
+checkresiduals(ARIMA.2.sales.extvar)
+
+sw_augment(ARIMA.2.sales.extvar) %>%
+    ggplot(aes(x = index, y = .resid)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_point(color = palette_light()[[1]], alpha = 0.5) +
+    geom_smooth(method = "loess") +
+    scale_x_yearmon(n = 3) +
+    labs(title = "Rolling Stock Forecast: ARIMA Residuals", x = "") + 
+    theme_tq()
+
+#forecast model
+fcast.ARIMA.2.extvar <- forecast(ARIMA.2.sales.extvar, h = 12, xreg = fcast.sales$mean)
+
+#fcast outputs
+sw_sweep(fcast.ARIMA.2.extvar, fitted = TRUE)
+
+plot <- autoplot(fcast.ARIMA.2.extvar, series="Forecast") +
+    autolayer(ARIMA.2.sales.extvar$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,1], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast ROlling Stock Test No ExtVars", i, sep = " "))
+  
+print(plot)
+
+Accuracy.df[2,1] <- "Net Sales"
+Accuracy.df[2,2:3] <- glance(ARIMA.2.sales.extvar)[3:4]
+Accuracy.df[2,4:10] <- accuracy(ARIMA.2.sales.extvar$fitted, US.Sales.ExpenseData.TS[,1])
+```
+
+```{r ARIMA model Test sales.chem.ext var, echo=FALSE, include=TRUE}
+ARIMA.2.chem.sales.extvar <- US.Sales.ExpenseData.TS[,1] %>%
+  #end training data at 2017 to show what 2018 would look like if we started from JAN
+  window(end = c(2017,12)) %>%
+  auto.arima(D = 1, approximation = FALSE, 
+             stepwise = FALSE, 
+             seasonal = TRUE,
+             xreg = window(US.Sales.ExpenseData.TS[,3], end = c(2017,12)))
+  
+#model parameters
+sw_tidy(ARIMA.2.chem.sales.extvar)
+#Accuracy Mesasures
+glance(ARIMA.2.chem.sales.extvar)
+#fitted and residuals
+sw_augment(ARIMA.2.chem.sales.extvar)
+checkresiduals(ARIMA.2.chem.sales.extvar)
+
+sw_augment(ARIMA.2.chem.sales.extvar) %>%
+    ggplot(aes(x = index, y = .resid)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_point(color = palette_light()[[1]], alpha = 0.5) +
+    geom_smooth(method = "loess") +
+    scale_x_yearmon(n = 3) +
+    labs(title = "Rolling Stock Forecast: ARIMA Residuals", x = "") + 
+    theme_tq()
+
+#forecast model
+fcast.ARIMA.2.chem.sales.extvar <- forecast(ARIMA.2.chem.sales.extvar, h = 12, xreg = fcast.chem$mean)
+
+#fcast outputs
+sw_sweep(fcast.ARIMA.2.chem.sales.extvar, fitted = TRUE)
+
+plot <- autoplot(fcast.ARIMA.2.chem.sales.extvar, series="Forecast") +
+    autolayer(ARIMA.2.chem.sales.extvar$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,1], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast ROlling Stock Test No ExtVars", i, sep = " "))
+  
+print(plot)
+
+Accuracy.df[3,1] <- "CHEM"
+Accuracy.df[3,2:3] <- glance(ARIMA.2.chem.sales.extvar)[3:4]
+Accuracy.df[3,4:10] <- accuracy(ARIMA.2.chem.sales.extvar$fitted, US.Sales.ExpenseData.TS[,1])
+```
+
+```{r ARIMA model Test sales.FERT.ext var, echo=FALSE, include=TRUE}
+ARIMA.2.fert.sales.extvar <- US.Sales.ExpenseData.TS[,1] %>%
+  #end training data at 2017 to show what 2018 would look like if we started from JAN
+  window(end = c(2017,12)) %>%
+  auto.arima(D = 1, approximation = FALSE, 
+             stepwise = FALSE, 
+             seasonal = TRUE,
+             xreg = window(US.Sales.ExpenseData.TS[,4], end = c(2017,12)))
+  
+#model parameters
+sw_tidy(ARIMA.2.fert.sales.extvar)
+#Accuracy Mesasures
+glance(ARIMA.2.fert.sales.extvar)
+#fitted and residuals
+sw_augment(ARIMA.2.fert.sales.extvar)
+checkresiduals(ARIMA.2.fert.sales.extvar)
+
+sw_augment(ARIMA.2.fert.sales.extvar) %>%
+    ggplot(aes(x = index, y = .resid)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_point(color = palette_light()[[1]], alpha = 0.5) +
+    geom_smooth(method = "loess") +
+    scale_x_yearmon(n = 3) +
+    labs(title = "Rolling Stock Forecast: ARIMA Residuals", x = "") + 
+    theme_tq()
+
+#forecast model
+fcast.ARIMA.2.fert.sales.extvar <- forecast(ARIMA.2.fert.sales.extvar, h = 12, xreg = fcast.fert$mean)
+
+#fcast outputs
+sw_sweep(fcast.ARIMA.2.fert.sales.extvar, fitted = TRUE)
+
+plot <- autoplot(fcast.ARIMA.2.fert.sales.extvar, series="Forecast") +
+    autolayer(ARIMA.2.fert.sales.extvar$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,1], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast ROlling Stock Test No ExtVars", i, sep = " "))
+  
+print(plot)
+
+Accuracy.df[4,1] <- "FERT"
+Accuracy.df[4,2:3] <- glance(ARIMA.2.chem.sales.extvar)[3:4]
+Accuracy.df[4,4:10] <- accuracy(ARIMA.2.fert.sales.extvar$fitted, US.Sales.ExpenseData.TS[,1])
+```
+
+```{r ARIMA model Test sales.seed.ext var, echo=FALSE, include=TRUE}
+ARIMA.2.seed.sales.extvar <- US.Sales.ExpenseData.TS[,1] %>%
+  #end training data at 2017 to show what 2018 would look like if we started from JAN
+  window(end = c(2017,12)) %>%
+  auto.arima(D = 1, approximation = FALSE, 
+             stepwise = FALSE, 
+             seasonal = TRUE,
+             xreg = window(US.Sales.ExpenseData.TS[,6], end = c(2017,12)))
+  
+#model parameters
+sw_tidy(ARIMA.2.seed.sales.extvar)
+#Accuracy Mesasures
+glance(ARIMA.2.seed.sales.extvar)
+#fitted and residuals
+sw_augment(ARIMA.2.seed.sales.extvar)
+checkresiduals(ARIMA.2.seed.sales.extvar)
+
+sw_augment(ARIMA.2.seed.sales.extvar) %>%
+    ggplot(aes(x = index, y = .resid)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_point(color = palette_light()[[1]], alpha = 0.5) +
+    geom_smooth(method = "loess") +
+    scale_x_yearmon(n = 3) +
+    labs(title = "Rolling Stock Forecast: ARIMA Residuals", x = "") + 
+    theme_tq()
+
+#forecast model
+fcast.ARIMA.2.seed.sales.extvar <- forecast(ARIMA.2.seed.sales.extvar, h = 12, xreg = fcast.seed$mean)
+
+#fcast outputs
+sw_sweep(fcast.ARIMA.2.seed.sales.extvar, fitted = TRUE)
+
+plot <- autoplot(fcast.ARIMA.2.seed.sales.extvar, series="Forecast") +
+    autolayer(ARIMA.2.seed.sales.extvar$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,1], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast ROlling Stock Test No ExtVars", i, sep = " "))
+  
+print(plot)
+
+Accuracy.df[5,1] <- "SEED"
+Accuracy.df[5,2:3] <- glance(ARIMA.2.seed.sales.extvar)[3:4]
+Accuracy.df[5,4:10] <- accuracy(ARIMA.2.seed.sales.extvar$fitted, US.Sales.ExpenseData.TS[,1])
+```
+
+```{r ARIMA model Test sales.appl.ext var, echo=FALSE, include=TRUE}
+ARIMA.2.appl.sales.extvar <- US.Sales.ExpenseData.TS[,1] %>%
+  #end training data at 2017 to show what 2018 would look like if we started from JAN
+  window(end = c(2017,12)) %>%
+  auto.arima(D = 1, approximation = FALSE, 
+             stepwise = FALSE, 
+             seasonal = TRUE,
+             xreg = window(US.Sales.ExpenseData.TS[,2], end = c(2017,12)))
+  
+#model parameters
+sw_tidy(ARIMA.2.appl.sales.extvar)
+#Accuracy Mesasures
+glance(ARIMA.2.appl.sales.extvar)
+#fitted and residuals
+sw_augment(ARIMA.2.appl.sales.extvar)
+checkresiduals(ARIMA.2.appl.sales.extvar)
+
+sw_augment(ARIMA.2.appl.sales.extvar) %>%
+    ggplot(aes(x = index, y = .resid)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_point(color = palette_light()[[1]], alpha = 0.5) +
+    geom_smooth(method = "loess") +
+    scale_x_yearmon(n = 3) +
+    labs(title = "Rolling Stock Forecast: ARIMA Residuals", x = "") + 
+    theme_tq()
+
+#forecast model
+fcast.ARIMA.2.appl.sales.extvar <- forecast(ARIMA.2.appl.sales.extvar, h = 12, xreg = fcast.appl $mean)
+
+#fcast outputs
+sw_sweep(fcast.ARIMA.2.appl.sales.extvar, fitted = TRUE)
+
+plot <- autoplot(fcast.ARIMA.2.appl.sales.extvar, series="Forecast") +
+    autolayer(ARIMA.2.appl.sales.extvar$fitted, series="Forecast Model") +
+    autolayer(US.Sales.ExpenseData.TS[,1], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("ARIMA Forecast ROlling Stock Test No ExtVars", i, sep = " "))
+  
+print(plot)
+
+Accuracy.df[6,1] <- "APPL"
+Accuracy.df[6,2:3] <- glance(ARIMA.2.appl.sales.extvar)[3:4]
+Accuracy.df[6,4:10] <- accuracy(ARIMA.2.appl.sales.extvar$fitted, US.Sales.ExpenseData.TS[,1])
+```
+
+```{r}
+print(Accuracy.df)
+```
+
+
+
+
+```{r mult, echo=FALSE}
+
+# model.RollStock.appl <- auto.arima(US.Roll.Stock.Sales.TS[,1], D = 1, 
+#                       approximation = FALSE, 
+#                       stepwise = FALSE, seasonal = TRUE,
+#                     xreg = stats::lag(US.Roll.Stock.Sales.TS[,3], k = 0))
+# model
+# summary(model)
+# glance(model)
+# 
+# 
+# fcast.model <- forecast(model, h = 12, xreg = US.Roll.Stock.Sales.TS[,12])
+# 
+# plot <- autoplot(fcast.model, series="Forecast") +
+#     autolayer(model$fitted, series="Forecast Model") +
+#     autolayer(US.Roll.Stock.Sales.TS[,1], series = "Actuals") + 
+#     xlab("Year") + 
+#     ylab("Actuals") +
+#     ggtitle(paste("ARIMA Forecast ROlling Stock Test Sales ExtVars", i, sep = " "))
+#   
+#   print(plot)
+
+
+
+
+
+
+```
+
+######################## CHEM FERT TEST ########################
+```{r CCF fert(X) to chem (y), include = FALSE}
+# #RS to Total Net Sales
+# ccf(diff(US.Roll.Stock.Sales.TS[,4], 12),
+# diff(US.Roll.Stock.Sales.TS[,3], 12))
+# 
+# model <- tslm(US.Roll.Stock.Sales.TS[,4] ~ US.Roll.Stock.Sales.TS[,3], data = US.Roll.Stock.Sales.TS)
+# summary(model)
+```
+
+```{r #RS to chem to fert Regression Testing, echo = FALSE, include = FALSE}
+# #create dataset
+#  data <- US.Total.Expense.Dataset.roll.stock.xts %>%
+#   #convert to tibble
+#   timetk::tk_tbl() %>%
+#   #select variables
+#   dplyr::select(index, US.Sales.Data.cutdown.TS.Net.Sales_CHEM, US.Sales.Data.cutdown.TS.Net.Sales_FERT) %>%
+#   #add lagged variables
+#   dplyr::mutate(saleslag.0 = lag(US.Sales.Data.cutdown.TS.Net.Sales_FERT, 0)) %>%
+#   dplyr::mutate(saleslag.1 = lag(US.Sales.Data.cutdown.TS.Net.Sales_FERT, 1)) %>%
+#   dplyr::mutate(saleslag.2 = lag(US.Sales.Data.cutdown.TS.Net.Sales_FERT, 2)) %>%
+#   dplyr::mutate(saleslag.3 = lag(US.Sales.Data.cutdown.TS.Net.Sales_FERT, 3))
+#   
+#   #linear regression model fert as a lagged variable of chem
+#   lag.model <- lm(US.Sales.Data.cutdown.TS.Net.Sales_CHEM ~ saleslag.1 + saleslag.2 + saleslag.3, data = data)
+#   summary(lag.model)
+#   plot(lag.model)
+```

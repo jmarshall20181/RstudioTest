@@ -1,0 +1,320 @@
+---
+title: "OPEX_Forecast"
+author: "Jason Marshall"
+date: "July 30, 2018"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libs}
+library(forecast)
+library(tidyquant)
+library(timetk)
+library(sweep)
+library(tidyverse)
+library(broom)
+library(timeDate)
+library(reshape2)
+library(data.table)
+library(readr)
+library(DataExplorer)
+library(Hmisc)
+library(caret)
+library(quantreg)
+```
+
+```{r load  expense data}
+# #load expense data
+# dataset.1 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - South.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.2 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - US.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.3 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - WCBT.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.4 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - West.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.5 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - CCBT.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.6 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - East.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.7 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - ECBT.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# #combine both datasets
+# comb.dataset <- bind_rows(dataset.1, dataset.2, dataset.3, dataset.4, dataset.5, dataset.6, dataset.7)
+# 
+# #fill NA
+# comb.dataset$Amount <- replace_na(comb.dataset$Amount, replace = 0)
+# 
+# #make unique col names
+# colsNamesShelf <-colnames(comb.dataset)
+# dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+# colnames(comb.dataset) <- dataset_col_names
+# 
+# #add date column
+# comb.dataset <- comb.dataset %>%
+#   mutate(day.holder = 01) %>%
+#   mutate(date.holder = paste(Year, Acct.Per, day.holder, sep = "-"))
+# 
+# #set date.holder as date
+# comb.dataset$date.holder <- as.Date(comb.dataset$date.holder)
+# 
+# #get last day of the month
+# comb.dataset$Date <- as.Date(timeDate::timeLastDayInMonth(comb.dataset$date.holder))
+# 
+# #write to disk
+# write.csv(comb.dataset,"Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US.opex.test.full.csv")
+
+####################################################################################
+expense.dataset <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US.opex.test.full.csv")
+
+#change strings to factors
+expense.dataset <- expense.dataset %>% mutate_if(is.character, as.factor)
+```
+
+```{r make panel expense dataset}
+#agregate data to yearly
+#granularity = division level
+expense.dataset.panel.total <- dcast(setDT(expense.dataset), formula = Geography + Region + Division ~ Year + Account, 
+                              value.var = c('Amount'), fun.aggregate = sum)
+
+#split pannel by year to help EDA
+year.values <- unique(expense.dataset$Year)
+for (i in year.values){
+  #print(i)
+  #filter dataframe
+  filtered.df <- expense.dataset %>% 
+  filter(Year == i)
+  
+  #create new dataset
+  assign(paste("expense.dataset", i, sep = "."),
+         #create wide/panel version
+         dcast(setDT(filtered.df), 
+               formula = Geography + Region + Division ~ Year + Account, 
+               value.var = c('Amount'), 
+               fun.aggregate = sum))
+}
+```
+
+```{r Expense Time Series}
+us.total.expense.dataset.ts <- expense.dataset %>% 
+  group_by()
+
+
+
+
+```
+
+
+
+```{r unit test}
+expense.dataset %>% 
+  group_by(Account, Year) %>%
+  summarise(Total.Expsent = sum(Amount))
+
+
+expense.dataset.panel.total[,-c(1,2,3)] %>% colSums()
+```
+
+```{r load sales data and format for timeseries analysis}
+#load sales data
+sales.dataset <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US_Region_Division_Added_Only_NA_Item_Sales_chopdown_test a557ef9eb.csv")
+
+#make unique col names
+colsNamesShelf <-colnames(sales.dataset)
+dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+colnames(sales.dataset) <- dataset_col_names
+
+#edit date format 
+sales.dataset$Invoice.Date <- as.Date(sales.dataset$Invoice.Date, format = '%B %d, %Y')
+
+#change invoice date to last month of the year for monthly sum and join with expense data
+sales.dataset$Invoice.Date <- timeLastDayInMonth(sales.dataset$Invoice.Date) 
+
+#change to character to facilitate group_by below
+sales.dataset$Invoice.Date <- as.character(sales.dataset$Invoice.Date)
+ 
+sales.dataset <- sales.dataset %>% 
+  group_by(Invoice.Date, Region, Region.Number, Division, Divsion.Number, GL.Shelf) %>%
+  summarise(Net.Sales = sum(Net.Sales), Total.Margin = sum(Total.Margin))
+```
+
+```{r create panel sales data}
+#create panel data#######################
+#add month year data
+sales.dataset.panel <- sales.dataset %>%
+  mutate(YEAR = year(Invoice.Date)) %>%
+  mutate(MONTH = month(Invoice.Date))
+
+#use setDATATABLE to generate long dataset  
+sales.dataset.panel <- dcast(setDT(sales.dataset.panel), formula = Region + Region.Number + Division + Divsion.Number ~ YEAR + GL.Shelf, value.var = c('Net.Sales', 'Total.Margin'), fun.aggregate = sum)
+
+#create yearly total columns
+sales.dataset.panel <- sales.dataset.panel %>% 
+  mutate(Net.Sales_TOTAL.2014 = rowSums(select(., starts_with("Net.Sales_2014")))) %>%
+  mutate(Net.Sales_TOTAL.2015 = rowSums(select(., starts_with("Net.Sales_2015")))) %>%
+  mutate(Net.Sales_TOTAL.2016 = rowSums(select(., starts_with("Net.Sales_2016")))) %>%
+  mutate(Net.Sales_TOTAL.2017 = rowSums(select(., starts_with("Net.Sales_2017")))) %>%
+  mutate(Net.Sales_TOTAL.2018 = rowSums(select(., starts_with("Net.Sales_2018")))) %>%
+  mutate(TOTAL.MARGIN.2014 = rowSums(select(., starts_with("Total.Margin_2014")))) %>%
+  mutate(TOTAL.MARGIN.2015 = rowSums(select(., starts_with("Total.Margin_2015")))) %>%
+  mutate(TOTAL.MARGIN.2016 = rowSums(select(., starts_with("Total.Margin_2016")))) %>%
+  mutate(TOTAL.MARGIN.2017 = rowSums(select(., starts_with("Total.Margin_2017")))) %>%
+  mutate(TOTAL.MARGIN.2018 = rowSums(select(., starts_with("Total.Margin_2018"))))
+
+#add timeseries data
+#sales.dataset.panel <- sales.dataset.panel %>%
+#  mutate(day.holder = 01) %>%
+#  mutate(date.holder = paste(YEAR, Acct.Per, day.holder, sep = "-"))
+
+#set date.holder as date  
+#sales.dataset.panel$date.holder <- as.Date(sales.dataset.panel$date.holder)  
+
+#get last day of the month
+#sales.dataset.panel$Date <- as.Date(timeDate::timeLastDayInMonth(sales.dataset.panel$date.holder))
+```
+
+
+```{r Merge expense and sales panel data}
+#convert to character
+expense.dataset.panel.total$Division <- as.character(expense.dataset.panel.total$Division)
+#convert to upper case
+expense.dataset.panel.total$Division <- toupper(expense.dataset.panel.total$Division)  
+
+expense.dataset.panel.total$Division <- gsub("\\ ", ".", expense.dataset.panel.total$Division)
+sales.dataset.panel$Division <- gsub("\\ ", ".", sales.dataset.panel$Division)
+
+comb.sales.exp.data <- inner_join(sales.dataset.panel, expense.dataset.panel.total, 
+                                  by = "Division")
+
+#write to disc for power BI
+write.csv(comb.sales.exp.data, "Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Results/Exploratory.Data.Analysis/comb.dataset.csv")
+
+```
+
+
+
+
+
+
+
+
+EDA #########################################
+```{r expense data EDA}
+#write to disc for power BI
+write.csv(expense.dataset, "Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Results/Exploratory.Data.Analysis/US.Total.opex.test.csv")
+
+summary(expense.dataset)
+length(levels(expense.dataset$Account))
+DataExplorer::plot_str(expense.dataset)
+DataExplorer::PlotMissing(expense.dataset)
+DataExplorer::plot_density(expense.dataset)
+DataExplorer::plot_bar(expense.dataset)
+```
+
+```{r panel expense data EDA}
+#write to disc for power BI
+write.csv(expense.dataset.panel.total, "Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Results/Exploratory.Data.Analysis/US.TOTAL.PANEL.csv")
+#granularity at a division level
+summary(expense.dataset.panel.total)
+summary(expense.dataset.2013)
+
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut]
+    )
+}
+
+corr.2013 <- Hmisc::rcorr(as.matrix(expense.dataset.2013[,-c(1:3)]))
+flatten.cor.matrix <- flattenCorrMatrix(corr.2013$r, corr.2013$P)
+```
+
+
+```{r US level Test}
+#summarize US data by GL Group by Date
+US.dataset <- comb.dataset %>%
+  #filter to us total data
+  filter(Region == 'United States Total') %>% 
+  #select cols
+  select(Account, Geography, Region, Amount, Date) %>%
+  #group cols
+  group_by(Account, Geography, Region, Date) %>%
+  #sum data
+  summarise(Sum.Amount = sum(Amount)) %>% 
+  #unpivot data
+  spread(key = Account, value = Sum.Amount, fill = 0)
+
+#add variable to get the last day of the month
+US.dataset <- US.dataset %>% 
+  mutate(day.holder = 01) %>%
+  unite(col = date.holder, Year, Acct.Per, day.holder, sep = "-") 
+
+#write to disk put in results directory
+#write.csv(US.dataset,"Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Results/US.Total.opex.test.csv")
+
+#convert to timeseries object
+xts.us.dataset <- timetk::tk_xts(US.dataset[,-c(1,2)], order.by = US.dataset$Date)
+```
+
+```{r US EDA}
+summary(xts.us.dataset)
+
+#plot seasonal effect
+boxplot(US.dataset[,4]~cycle(US.dataset[,4]), main = "NA_Retail Actuals")
+
+#plot expense data
+for (i in names(xts.us.dataset)){
+  plot <- autoplot(xts.us.dataset[,i]) + 
+  geom_smooth(method = "loess")
+  
+  print(plot)
+}
+
+```
+
+
+```{r quantile regresion test}
+tau <- tau <- seq(from = .20, to = .80, by = .2)
+
+df.cutdown <- comb.sales.exp.data[,c(3,59,64,437,484,488,490)]
+
+colnames(df.cutdown)
+
+df.cutdown$`2018_522001 - Salary Base Salary` <- -abs(df.cutdown$`2018_522001 - Salary Base Salary`)
+df.cutdown$`2018_MARKETING` <- -abs(df.cutdown$`2018_MARKETING`)
+df.cutdown$`2018_RENTAL` <- -abs(df.cutdown$`2018_RENTAL`)
+df.cutdown$`2018_ROLLING_STOCK` <- -abs(df.cutdown$`2018_ROLLING_STOCK`)
+
+quant.test <- rq(TOTAL.MARGIN.2018 ~ .,
+                               data = df.cutdown[,-c(1,2)], tau = tau)
+
+summary(quant.test, se = "boot")
+plot(summary(quant.test, se = "boot"))
+
+chem.seed.fert.df <- comb.sales.exp.data[,c(25,26,27,28,29,64)]
+
+chem.seed.fert.test <- rq(TOTAL.MARGIN.2018 ~ .,
+                               data = chem.seed.fert.df, tau = tau)
+
+summary(chem.seed.fert.test, se = "boot")
+plot(summary(chem.seed.fert.test, se = "boot"))
+```
+
+
+
+
+
+

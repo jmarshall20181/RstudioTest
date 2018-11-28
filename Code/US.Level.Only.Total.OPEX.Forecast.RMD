@@ -1,0 +1,196 @@
+---
+title: "US.Level.Only.Total.OPEX.Forecast"
+author: "Jason Marshall"
+date: "August 7, 2018"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libs}
+library(forecast)
+library(tidyquant)
+library(timetk)
+library(sweep)
+library(tidyverse)
+library(broom)
+library(timeDate)
+library(reshape2)
+library(data.table)
+library(readr)
+library(DataExplorer)
+library(Hmisc)
+library(caret)
+library(quantreg)
+```
+
+```{r load  expense data}
+# #load expense data
+# dataset.1 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - South.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.2 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - US.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.3 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - WCBT.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.4 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - West.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.5 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - CCBT.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.6 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - East.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# dataset.7 <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/OpEx Expenses v2 - ECBT.csv",
+#     col_types = cols(Amount = col_number()))
+# 
+# #combine both datasets
+# comb.dataset <- bind_rows(dataset.1, dataset.2, dataset.3, dataset.4, dataset.5, dataset.6, dataset.7)
+# 
+# #fill NA
+# comb.dataset$Amount <- replace_na(comb.dataset$Amount, replace = 0)
+# 
+# #make unique col names
+# colsNamesShelf <-colnames(comb.dataset)
+# dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+# colnames(comb.dataset) <- dataset_col_names
+# 
+# #add date column
+# comb.dataset <- comb.dataset %>%
+#   mutate(day.holder = 01) %>%
+#   mutate(date.holder = paste(Year, Acct.Per, day.holder, sep = "-"))
+# 
+# #set date.holder as date
+# comb.dataset$date.holder <- as.Date(comb.dataset$date.holder)
+# 
+# #get last day of the month
+# comb.dataset$Date <- as.Date(timeDate::timeLastDayInMonth(comb.dataset$date.holder))
+# 
+# #write to disk
+# write.csv(comb.dataset,"Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US.opex.test.full.csv")
+
+####################################################################################
+expense.dataset <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US.opex.test.full.csv")
+
+#change strings to factors
+expense.dataset <- expense.dataset %>% mutate_if(is.character, as.factor)
+```
+
+```{r make time series object at US Level}
+#subset down to US Total Sum
+US.Total.Expense.Dataset <- expense.dataset %>%
+  group_by(Date, Parent.Account, Geography) %>%
+  summarise(Expense.Sum = sum(Amount))
+
+#make wide version
+US.Total.Expense.Dataset <- dcast(setDT(US.Total.Expense.Dataset), 
+                                     formula = Date + Geography ~ Parent.Account,
+                                     value.var = c("Expense.Sum"),
+                                     fun.aggregate = sum)
+#fill NAs 
+US.Total.Expense.Dataset[is.na(US.Total.Expense.Dataset)] <- 0
+
+#sort oldest to newest
+US.Total.Expense.Dataset <- US.Total.Expense.Dataset[order(US.Total.Expense.Dataset$Date, decreasing = FALSE)]
+
+#create ts object drop first two cols (non-numeric)
+US.Total.Expense.Dataset.TS <- ts(data = US.Total.Expense.Dataset[,-c(1,2)], 
+                                     start = c(2013,01), frequency = 12)
+
+```
+
+```{r US.Total EDA}
+autoplot(US.Total.Expense.Dataset.TS)
+
+cols <- colnames(US.Total.Expense.Dataset.TS)
+
+#plot each column
+for (i in cols){
+   ts.plot <- autoplot(US.Total.Expense.Dataset.TS[,i]) +
+     geom_smooth(method = "loess") +
+     ggtitle(i)
+   print(ts.plot)
+}
+
+#seasonplot each column
+for (i in cols){
+   season.plot <- ggseasonplot(US.Total.Expense.Dataset.TS[,i]) + 
+     ggtitle(i)
+   print(season.plot)
+}
+
+#season subseries plot each column
+for (i in cols){
+   sub.season.plot <- ggsubseriesplot(US.Total.Expense.Dataset.TS[,i]) + 
+     ggtitle(i)
+   print(sub.season.plot)
+}
+```
+
+```{r decompose plots}
+cols <- colnames(US.Total.Expense.Dataset.TS)
+for (i in cols){
+  decomp.plot <- plot(decompose(US.Total.Expense.Dataset.TS[,i]))  
+  print(decomp.plot)
+}
+```
+
+```{r tslm}
+# tslm.1 <- tslm(US.Total.Expense.Dataset.TS[,1] ~ trend + season)
+# tslm.1
+# 
+# summary(tslm.1)
+# checkresiduals(tslm.1)
+
+cols <- colnames(US.Total.Expense.Dataset.TS)
+#loop through cols with linear model
+for (i in cols){
+  tslm.mod <- tslm(US.Total.Expense.Dataset.TS[,i] ~ season)
+  forecast <- forecast(tslm.mod, h = 12)
+    
+  forecast.plot <-  autoplot(forecast , series="Forecast") +
+      autolayer(tslm.mod$fitted, series="Forecast Model") +
+      autolayer(US.Total.Expense.Dataset.TS[,i], series = "Actuals") + 
+      xlab("Year") + 
+      ylab("Actuals") +
+      ggtitle(paste("Regression Forecast Test TSLM", i, sep = " "))
+  
+  print(forecast.plot)
+}
+```
+
+```{r ets}
+cols <- colnames(US.Total.Expense.Dataset.TS)
+for (i in cols){
+  ets.1 <- ets(US.Total.Expense.Dataset.TS[,i])
+  #ets.1
+
+  fx.ets.1 <- forecast(ets.1, h = 12)
+
+  plot <- autoplot(fx.ets.1, series="Forecast") +
+    autolayer(ets.1$fitted, series="Forecast Model") +
+    autolayer(US.Total.Expense.Dataset.TS[,i], series = "Actuals") + 
+    xlab("Year") + 
+    ylab("Actuals") +
+    ggtitle(paste("Regression Forecast Test ETS", i, sep = " "))
+  
+  print(plot)
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+

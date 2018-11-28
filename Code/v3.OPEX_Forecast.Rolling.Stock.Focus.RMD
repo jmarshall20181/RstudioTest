@@ -1,0 +1,798 @@
+---
+title: "v3.OPEX_Forecast.Rolling.Stock.Focus"
+author: "Jason Marshall"
+date: "September 5, 2018"
+output: word_document
+---
+
+#Version 3 Refocus of project to create regional forecasts by rolling stock subcategory
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libs, include=FALSE, echo=FALSE, include = FALSE}
+library(forecast) #time series forecast
+library(tidyquant)
+library(timetk) #edit time serices objects
+library(sweep) #tidy model outputs
+library(tidyverse) #tidy data
+library(broom) #tidy ts model outputs
+library(timeDate) #edit ts objects
+library(reshape2) #shape data
+library(data.table) #shape data setDT
+library(readr) #data inport
+library(corrr)      # Tidy correlation tables and correlation plotting
+library(cowplot)    # Multiple plots with plot_grid()
+library(tseries) #adf.test
+library(astsa) #lag plot
+library(TSA)
+#library(DataExplorer) #exploratory data analysis
+#library(Hmisc)
+#library(caret) #model building
+library(quantreg) #quantile regression
+library(GGally)
+```
+
+```{r load expense data and create wide version of data, echo=FALSE}
+####################################################################################
+expense.dataset <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/rolling.stock.focus/US.Rolling.Stock.Expense.csv", 
+    col_types = cols(Amount = col_number()))
+
+# make unique col names
+ colsNamesShelf <-colnames(expense.dataset)
+ dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+ colnames(expense.dataset) <- dataset_col_names
+
+#add date column
+ expense.dataset <- expense.dataset %>%
+   #add day 01 just to get a complete date
+   mutate(day.holder = 01) %>%
+   #add year and month
+   mutate(date.holder = paste(Year, Acct.Per, day.holder, sep = "-"))
+
+#set date.holder as date
+ expense.dataset$date.holder <- as.Date(expense.dataset$date.holder)
+
+# #get last day of the month
+ expense.dataset$Date <- as.Date(timeDate::timeLastDayInMonth(expense.dataset$date.holder))
+
+#Filter closed, wholesale, terminal, DC divisions
+expense.dataset <- expense.dataset %>% 
+  filter(str_detect(Division, "Admin") == FALSE) %>% 
+  filter(str_detect(Division, "Closed") == FALSE) %>%
+  filter(str_detect(Division, "DC") == FALSE) %>%
+  filter(str_detect(Division, "Distribution") == FALSE) %>%
+  filter(str_detect(Division, "Wholesale") == FALSE) %>%
+  filter(str_detect(Division, "Terminals") == FALSE) %>%
+  filter(str_detect(Division, "Terminal") == FALSE)
+
+#change strings to factors
+#create summarized wide dataset
+#colnames(expense.dataset)
+expense.dataset.wide <- expense.dataset %>% mutate_if(is.character, as.factor) %>%
+  dplyr::select(Account, Region, Amount, Date) %>%
+  group_by(Account, Region,Date) %>%
+  summarise(Amount = sum(Amount))
+
+expense.dataset.wide <- dcast(data.table::setDT(expense.dataset.wide), 
+                                     formula = Date + Region ~ Account,
+                                     value.var = c("Amount"),
+                                     fun.aggregate = sum)
+
+#make unique col names
+colsNamesShelf <-colnames(expense.dataset.wide)
+dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+colnames(expense.dataset.wide) <- dataset_col_names
+colnames(expense.dataset.wide)
+
+#make total rollstock cols
+expense.dataset.wide <- expense.dataset.wide %>%
+  mutate(Rolling.Stock =  X538000...Fuel.Petrol + 
+           X538004...R.M.Delivery.Plant.Vehicles + 
+           X538006...R.M.Field.Equipment + 
+           X538007...R.M.Passenger.Vehicles)
+#fill NAs
+#expense.dataset.wide$Amount <- replace_na(expense.dataset.wide$Amount, 0)
+
+#summary check
+#expense.dataset %>% group_by(Region) %>% summarise(sum = sum(Amount))
+summary(expense.dataset.wide)
+
+#test data set
+sum(expense.dataset$Amount) == sum(Filter(is.numeric, expense.dataset.wide))
+```
+
+```{r add sales data, echo=FALSE}
+US.Sales.Data <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US_Region_Division_Added_Only_NA_Item_Sales_chopdown_test a557ef9eb.csv")
+
+# #make unique col names
+colsNamesShelf <-colnames(US.Sales.Data)
+dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+colnames(US.Sales.Data) <- dataset_col_names
+
+#edit date format 
+US.Sales.Data$Invoice.Date <- as.Date(US.Sales.Data$Invoice.Date, format = '%B %d, %Y')
+
+#change invoice date to last month of the year for monthly sum and join with expense data
+US.Sales.Data$Invoice.Date <- timeLastDayInMonth(US.Sales.Data$Invoice.Date) 
+
+#change to character to facilitate group_by below
+US.Sales.Data$Invoice.Date <- as.character(US.Sales.Data$Invoice.Date)
+
+#summarise by region
+US.Sales.Data <- US.Sales.Data %>% select(Invoice.Date, Region, GL.Shelf, Net.Sales)
+
+#create wide version
+US.Sales.Data.Wide <- dcast.data.table(data.table::setDT(US.Sales.Data),formula = Invoice.Date + Region ~ GL.Shelf,
+                   value.var = c("Net.Sales"),
+                   fun.aggregate = sum)
+#create total sales col
+US.Sales.Data.Wide <- US.Sales.Data.Wide %>%
+  mutate(Total.Sales = (APPL + CHEM + FERT + OTHE + SEED))
+```
+
+```{r join data sets}
+#set region to uppper case
+expense.dataset.wide$Region <- toupper(expense.dataset.wide$Region)
+
+#replace space in REGION with .
+expense.dataset.wide$Region <- gsub(" ", ".", expense.dataset.wide$Region)
+US.Sales.Data.Wide$Region <- gsub(" ", ".", US.Sales.Data.Wide$Region)
+
+#create Keys expense data
+expense.dataset.wide$key <- paste(expense.dataset.wide$Date, expense.dataset.wide$Region)
+expense.dataset.wide$key <- gsub(" ", ".", expense.dataset.wide$key)
+
+#create keys sales data
+US.Sales.Data.Wide$key <- paste(US.Sales.Data.Wide$Invoice.Date, US.Sales.Data.Wide$Region)
+#fill space between date and region with "."
+US.Sales.Data.Wide$key <- gsub(" ", ".", US.Sales.Data.Wide$key)
+#join data sets
+US.Sales.RollStock.Data <- dplyr::inner_join(x = expense.dataset.wide, y = US.Sales.Data.Wide,
+                                             by = "key")
+
+#set Region to factor
+US.Sales.RollStock.Data$Region.x <- as.factor(US.Sales.RollStock.Data$Region.x)
+
+summary(US.Sales.RollStock.Data)
+colnames(US.Sales.RollStock.Data)
+```
+
+##Create Nested Datasets
+```{r nest data rolling stock by region, echo = FALSE}
+#consolidate each dataset by group
+Nest.US.Sales.RollStock.Data <- US.Sales.RollStock.Data %>%
+  group_by(Region.x) %>%
+  nest(.key = "data.tbl")
+
+Nest.US.Sales.RollStock.Data
+
+#access each dataset
+Nest.US.Sales.RollStock.Data$data.tbl[1]
+```
+
+```{r nest data fuel by region, echo = FALSE}
+#consolidate each dataset by group
+Nest.fuel <- US.Sales.RollStock.Data[,c("X538000...Fuel.Petrol", "Region.x", "Date")] %>%
+  group_by(Region.x) %>%
+  nest(.key = "data.tbl")
+
+Nest.fuel
+
+#access each dataset
+Nest.fuel$data.tbl[1]
+```
+
+```{r nest data plant.vehix by region, echo = FALSE}
+#consolidate each dataset by group
+Nest.plant.vehix <- US.Sales.RollStock.Data[,c("X538004...R.M.Delivery.Plant.Vehicles", "Region.x", "Date")] %>%
+  group_by(Region.x) %>%
+  nest(.key = "data.tbl")
+
+Nest.plant.vehix
+
+#access each dataset
+Nest.plant.vehix$data.tbl[1]
+```
+
+```{r nest data field equipment by region, echo = FALSE}
+#consolidate each dataset by group
+Nest.field.equipment <- US.Sales.RollStock.Data[,c("X538006...R.M.Field.Equipment", "Region.x", "Date")] %>%
+  group_by(Region.x) %>%
+  nest(.key = "data.tbl")
+
+Nest.field.equipment
+
+#access each dataset
+Nest.field.equipment$data.tbl[1]
+```
+
+```{r nest data passenger video by region, echo = FALSE}
+#consolidate each dataset by group
+Nest.passenger.vehix <- US.Sales.RollStock.Data[,c("X538007...R.M.Passenger.Vehicles", "Region.x", "Date")] %>%
+  group_by(Region.x) %>%
+  nest(.key = "data.tbl")
+
+Nest.passenger.vehix
+
+#access each dataset
+Nest.passenger.vehix$data.tbl[1]
+```
+
+```{r nest data rolling stock total video by region, echo = FALSE}
+#consolidate each dataset by group
+Nest.rolling.stock.total <- US.Sales.RollStock.Data[,c("Rolling.Stock", "Region.x", "Date")] %>%
+  group_by(Region.x) %>%
+  nest(.key = "data.tbl")
+
+Nest.rolling.stock.total
+
+#access each dataset
+Nest.rolling.stock.total$data.tbl[1]
+```
+
+##Create TS Objects
+```{r coerce into TS object1, echo = FALSE}
+#consolidate each dataset by group
+TS.US.Sales.RollStock.Data <- Nest.US.Sales.RollStock.Data %>%
+  #create list of ts objects for each region
+  mutate(data.ts = map(
+    .x = data.tbl,
+    .f = tk_ts,
+    #drop invoice date, key, and region data
+    select = c(-Invoice.Date, -Region.y, -key),
+    start = 2014,
+    freq = 12))
+
+TS.US.Sales.RollStock.Data
+
+#access each dataset
+TS.US.Sales.RollStock.Data$data.ts
+```
+
+```{r coerce fuel into TS object2, echo = FALSE}
+#consolidate each dataset by group
+TS.Nest.fuel <- Nest.fuel %>%
+  #create list of ts objects for each region
+  mutate(fuel.data.ts = map(
+    .x = data.tbl,
+    .f = tk_ts,
+    #drop invoice date, key, and region data
+    select = c(X538000...Fuel.Petrol, Date),
+    start = 2014,
+    freq = 12))
+
+TS.Nest.fuel
+
+#access each dataset
+TS.US.Sales.RollStock.Data$data.ts
+```
+
+```{r coerce plant vehicle into TS object, echo = FALSE}
+#consolidate each dataset by group
+TS.US.plant.vehicle.Data <- Nest.US.Sales.RollStock.Data %>%
+  #create list of ts objects for each region
+  mutate(plant.vehix.data.ts = map(
+    .x = data.tbl,
+    .f = tk_ts,
+    #drop invoice date, key, and region data
+    select = c(X538004...R.M.Delivery.Plant.Vehicles, Date),
+    start = 2014,
+    freq = 12))
+
+TS.US.plant.vehicle.Data
+
+#access each dataset
+TS.US.plant.vehicle.Data$plant.vehix.data.ts
+```
+
+```{r coerce field equip into TS object, echo = FALSE}
+#consolidate each dataset by group
+TS.field.equip.Data <- Nest.US.Sales.RollStock.Data %>%
+  #create list of ts objects for each region
+  mutate(field.equip.data.ts = map(
+    .x = data.tbl,
+    .f = tk_ts,
+    #drop invoice date, key, and region data
+    select = c(X538006...R.M.Field.Equipment, Date),
+    start = 2014,
+    freq = 12))
+
+TS.field.equip.Data
+
+#access each dataset
+TS.field.equip.Data$field.equip.data.ts
+```
+
+```{r coerce  passenger vehix into TS object, echo = FALSE}
+#consolidate each dataset by group
+TS.passenger.vehix.Data <- Nest.US.Sales.RollStock.Data %>%
+  #create list of ts objects for each region
+  mutate(passeger.vehix.data.ts = map(
+    .x = data.tbl,
+    .f = tk_ts,
+    #drop invoice date, key, and region data
+    select = c(X538007...R.M.Passenger.Vehicles, Date),
+    start = 2014,
+    freq = 12))
+
+TS.passenger.vehix.Data
+
+#access each dataset
+TS.passenger.vehix.Data$passeger.vehix.data.ts
+```
+
+```{r coerce into TS object3, echo = FALSE}
+#consolidate each dataset by group
+TS.RollStock.Data <- Nest.US.Sales.RollStock.Data %>%
+  #create list of ts objects for each region
+  mutate(rolling.stock.data.ts = map(
+    .x = data.tbl,
+    .f = tk_ts,
+    #drop invoice date, key, and region data
+    select = c(Rolling.Stock, Date),
+    start = 2014,
+    freq = 12))
+
+TS.RollStock.Data
+
+#access each dataset
+TS.RollStock.Data$rolling.stock.data.ts
+```
+
+
+```{r plot each ts object4, echo=FALSE}
+#TS.US.Sales.RollStock.Data
+autoplot(TS.US.Sales.RollStock.Data$data.ts[[1]]) +
+  ggtitle(TS.US.Sales.RollStock.Data$Region.x[[1]])
+
+autoplot(TS.US.Sales.RollStock.Data$data.ts[[2]]) +
+  ggtitle(TS.US.Sales.RollStock.Data$Region.x[[2]])
+
+autoplot(TS.US.Sales.RollStock.Data$data.ts[[3]]) +
+  ggtitle(TS.US.Sales.RollStock.Data$Region.x[[3]])
+
+autoplot(TS.US.Sales.RollStock.Data$data.ts[[4]]) +
+  ggtitle(TS.US.Sales.RollStock.Data$Region.x[[4]])
+
+autoplot(TS.US.Sales.RollStock.Data$data.ts[[5]]) +
+  ggtitle(TS.US.Sales.RollStock.Data$Region.x[[5]])
+
+autoplot(TS.US.Sales.RollStock.Data$data.ts[[6]]) +
+  ggtitle(TS.US.Sales.RollStock.Data$Region.x[[6]])
+```
+
+```{r ETS model Fuel.Petrol, echo=FALSE}
+#ETS model fuel.petrol
+autoplot(TS.Nest.fuel$fuel.data.ts[[1]]) +
+           ggtitle(TS.Nest.fuel$Region.x[[1]])
+
+autoplot(TS.Nest.fuel$fuel.data.ts[[2]]) +
+           ggtitle(TS.Nest.fuel$Region.x[[2]])
+
+autoplot(TS.Nest.fuel$fuel.data.ts[[3]]) +
+           ggtitle(TS.Nest.fuel$Region.x[[3]])
+
+autoplot(TS.Nest.fuel$fuel.data.ts[[4]]) +
+           ggtitle(TS.Nest.fuel$Region.x[[4]])
+
+autoplot(TS.Nest.fuel$fuel.data.ts[[5]]) +
+           ggtitle(TS.Nest.fuel$Region.x[[5]])
+
+autoplot(TS.Nest.fuel$fuel.data.ts[[6]]) +
+           ggtitle(TS.Nest.fuel$Region.x[[6]])
+
+fuel.petrol.fit <- TS.Nest.fuel %>%
+  mutate(fit.ets = map(fuel.data.ts, ets))
+
+fuel.petrol.fit
+
+#model parameters
+fuel.petrol.fit %>%
+  mutate(tidy = map(fit.ets, sw_tidy)) %>%
+  unnest(tidy, .drop = TRUE) %>%
+  spread(key = Region.x, value = estimate)
+
+#model accuracy
+fuel.petrol.fit %>%
+  mutate(glance = map(fit.ets, sw_glance)) %>%
+  unnest(glance, .drop = TRUE)
+
+#fitted and residual values
+fuel.augment.fit.ets <- fuel.petrol.fit %>%
+  mutate(augment = map(fit.ets, sw_augment, timetk_idx = TRUE, rename_index = "Date")) %>%
+  unnest(augment, .drop = TRUE)
+#fuel.augment.fit.ets
+
+fuel.augment.fit.ets %>%
+    ggplot(aes(x = Date, y = .resid, group = Region.x)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_line(color = palette_light()[[2]]) +
+    geom_smooth(method = "loess") +
+    labs(title = "Fuel/Petrol by Region",
+         subtitle = "ETS Model Residuals", x = "") + 
+    theme_tq() +
+    facet_wrap(~ Region.x, scale = "free_y", ncol = 3) +
+    scale_x_date(date_labels = "%Y")
+
+
+#forecast model
+fcast.fuel.augment.fit.ets <- fuel.petrol.fit %>%
+    mutate(fuel.fcast.ets = map(fit.ets, forecast, h = 12))
+fcast.fuel.augment.fit.ets
+
+fuel.petrol.fit
+
+#Tidy Forecast
+fcast.fuel.augment.fit.ets.tidy <- fcast.fuel.augment.fit.ets %>%
+    mutate(sweep = map(fuel.fcast.ets, sw_sweep, fitted = FALSE, timetk_idx = TRUE)) %>%
+    unnest(sweep)
+
+fcast.fuel.augment.fit.ets.tidy
+
+#plot forecasts
+fcast.fuel.augment.fit.ets.tidy %>%
+    ggplot(aes(x = index, y = X538000...Fuel.Petrol, color = key, group = Region.x)) +
+    geom_ribbon(aes(ymin = lo.95, ymax = hi.95), 
+                fill = "#D5DBFF", color = NA, size = 0) +
+    geom_ribbon(aes(ymin = lo.80, ymax = hi.80, fill = key), 
+                fill = "#596DD5", color = NA, size = 0, alpha = 0.8) +
+    geom_line() +
+    labs(title = "Fuel/Petrol by Region",
+         subtitle = "ETS Model Forecasts",
+         x = "", y = "Units") +
+    scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+    scale_color_tq() +
+    scale_fill_tq() +
+    facet_wrap(~ Region.x, scales = "free_y", ncol = 3) +
+    theme_tq() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r ETS model Delivery Plant, echo=FALSE}
+num <- c(1,2,3,4,5,6)
+
+#ETS model fuel.petrol
+for (i in num){
+ plot <- autoplot(TS.US.plant.vehicle.Data$plant.vehix.data.ts[[i]]) +
+           ggtitle(TS.US.plant.vehicle.Data$Region.x[[i]])
+ print(plot)
+}
+
+
+delivery.fit <- TS.US.plant.vehicle.Data %>%
+  mutate(fit.ets = map(plant.vehix.data.ts, ets))
+
+#delivery.fit
+
+#model parameters
+delivery.fit %>%
+  mutate(tidy = map(fit.ets, sw_tidy)) %>%
+  unnest(tidy, .drop = TRUE) %>%
+  spread(key = Region.x, value = estimate)
+
+#model accuracy
+delivery.fit %>%
+  mutate(glance = map(fit.ets, sw_glance)) %>%
+  unnest(glance, .drop = TRUE)
+
+#fitted and residual values
+augment.delivery.fit <- delivery.fit %>%
+  mutate(augment = map(fit.ets, sw_augment, timetk_idx = TRUE, rename_index = "Date")) %>%
+  unnest(augment, .drop = TRUE)
+#fuel.augment.fit.ets
+
+augment.delivery.fit %>%
+    ggplot(aes(x = Date, y = .resid, group = Region.x)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_line(color = palette_light()[[2]]) +
+    geom_smooth(method = "loess") +
+    labs(title = "Plant/Delivery Vehicle by Region",
+         subtitle = "ETS Model Residuals", x = "") + 
+    theme_tq() +
+    facet_wrap(~ Region.x, scale = "free_y", ncol = 3) +
+    scale_x_date(date_labels = "%Y")
+
+
+#forecast model
+fcast.delivery.fit <- delivery.fit %>%
+    mutate(fcast.delivery.fit = map(fit.ets, forecast, h = 12))
+fcast.delivery.fit
+
+fcast.delivery.fit
+
+#Tidy Forecast
+fcast.delivery.fit.ets.tidy <- fcast.delivery.fit %>%
+    mutate(sweep = map(fcast.delivery.fit, sw_sweep, fitted = FALSE, timetk_idx = TRUE)) %>%
+    unnest(sweep)
+
+fcast.delivery.fit.ets.tidy
+
+#plot forecasts
+fcast.delivery.fit.ets.tidy %>%
+    ggplot(aes(x = index, y = X538004...R.M.Delivery.Plant.Vehicles, color = key, group = Region.x)) +
+    geom_ribbon(aes(ymin = lo.95, ymax = hi.95), 
+                fill = "#D5DBFF", color = NA, size = 0) +
+    geom_ribbon(aes(ymin = lo.80, ymax = hi.80, fill = key), 
+                fill = "#596DD5", color = NA, size = 0, alpha = 0.8) +
+    geom_line() +
+    labs(title = "Plant/Delivery Vehicle Forecast by Region",
+         subtitle = "ETS Model Forecasts",
+         x = "", y = "Units") +
+    scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+    scale_color_tq() +
+    scale_fill_tq() +
+    facet_wrap(~ Region.x, scales = "free_y", ncol = 3) +
+    theme_tq() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r ETS model Field Equipment, echo=FALSE}
+num <- c(1,2,3,4,5,6)
+
+#ETS model Field Equipment
+for (i in num){
+ plot <- autoplot(TS.field.equip.Data$field.equip.data.ts[[i]]) +
+           ggtitle(TS.field.equip.Data$Region.x[[i]])
+ print(plot)
+}
+
+#field equip fit
+field.equip.fit <- TS.field.equip.Data %>%
+  mutate(fit.ets = map(field.equip.data.ts, ets))
+
+#delivery.fit
+
+#model parameters
+field.equip.fit %>%
+  mutate(tidy = map(fit.ets, sw_tidy)) %>%
+  unnest(tidy, .drop = TRUE) %>%
+  spread(key = Region.x, value = estimate)
+
+#model accuracy
+field.equip.fit %>%
+  mutate(glance = map(fit.ets, sw_glance)) %>%
+  unnest(glance, .drop = TRUE)
+
+#fitted and residual values
+augment.field.equip.fit <- field.equip.fit %>%
+  mutate(augment = map(fit.ets, sw_augment, timetk_idx = TRUE, rename_index = "Date")) %>%
+  unnest(augment, .drop = TRUE)
+#fuel.augment.fit.ets
+
+#Plot model residuals
+augment.field.equip.fit %>%
+    ggplot(aes(x = Date, y = .resid, group = Region.x)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_line(color = palette_light()[[2]]) +
+    geom_smooth(method = "loess") +
+    labs(title = "Field Equipment by Region",
+         subtitle = "ETS Model Residuals", x = "") + 
+    theme_tq() +
+    facet_wrap(~ Region.x, scale = "free_y", ncol = 3) +
+    scale_x_date(date_labels = "%Y")
+
+
+#forecast model
+fcast.field.equip.fit <- field.equip.fit %>%
+    mutate(fcast.field.equip = map(fit.ets, forecast, h = 12))
+#fcast.delivery.fit
+
+#fcast.delivery.fit
+
+#Tidy Forecast
+fcast.field.equip.fit.tidy <- fcast.field.equip.fit %>%
+    mutate(sweep = map(fcast.field.equip, sw_sweep, fitted = FALSE, timetk_idx = TRUE)) %>%
+    unnest(sweep)
+
+#fcast.field.equip.fit.tidy
+
+#plot forecasts
+fcast.field.equip.fit.tidy %>%
+    ggplot(aes(x = index, y = X538006...R.M.Field.Equipment, color = key, group = Region.x)) +
+    geom_ribbon(aes(ymin = lo.95, ymax = hi.95), 
+                fill = "#D5DBFF", color = NA, size = 0) +
+    geom_ribbon(aes(ymin = lo.80, ymax = hi.80, fill = key), 
+                fill = "#596DD5", color = NA, size = 0, alpha = 0.8) +
+    geom_line() +
+    labs(title = "Field Equipment Forecast by Region",
+         subtitle = "ETS Model Forecasts",
+         x = "", y = "Units") +
+    scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+    scale_color_tq() +
+    scale_fill_tq() +
+    facet_wrap(~ Region.x, scales = "free_y", ncol = 3) +
+    theme_tq() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r ETS Passenger Vehix, echo=FALSE}
+num <- c(1,2,3,4,5,6)
+
+#ETS model passenger vehicle
+for (i in num){
+ plot <- autoplot(TS.passenger.vehix.Data$passeger.vehix.data.ts[[i]]) +
+           ggtitle(TS.passenger.vehix.Data$Region.x[[i]])
+ print(plot)
+}
+
+#field equip fit
+passenger.vehix.fit <- TS.passenger.vehix.Data %>%
+  mutate(fit.ets = map(passeger.vehix.data.ts, ets))
+
+#delivery.fit
+
+#model parameters
+passenger.vehix.fit %>%
+  mutate(tidy = map(fit.ets, sw_tidy)) %>%
+  unnest(tidy, .drop = TRUE) %>%
+  spread(key = Region.x, value = estimate)
+
+#model accuracy
+passenger.vehix.fit %>%
+  mutate(glance = map(fit.ets, sw_glance)) %>%
+  unnest(glance, .drop = TRUE)
+
+#fitted and residual values
+augment.passenger.vehix.fit <- passenger.vehix.fit %>%
+  mutate(augment = map(fit.ets, sw_augment, timetk_idx = TRUE, rename_index = "Date")) %>%
+  unnest(augment, .drop = TRUE)
+#fuel.augment.fit.ets
+
+#Plot model residuals
+augment.passenger.vehix.fit %>%
+    ggplot(aes(x = Date, y = .resid, group = Region.x)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_line(color = palette_light()[[2]]) +
+    geom_smooth(method = "loess") +
+    labs(title = "Passenger Vehicle by Region",
+         subtitle = "ETS Model Residuals", x = "") + 
+    theme_tq() +
+    facet_wrap(~ Region.x, scale = "free_y", ncol = 3) +
+    scale_x_date(date_labels = "%Y")
+
+
+#forecast model
+fcast.passenger.vehix.fit <- passenger.vehix.fit %>%
+    mutate(fcast.passenger.vehix = map(fit.ets, forecast, h = 12))
+#fcast.delivery.fit
+
+#fcast.delivery.fit
+
+#Tidy Forecast
+fcast.passenger.vehix.fit.tidy <- fcast.passenger.vehix.fit %>%
+    mutate(sweep = map(fcast.passenger.vehix, sw_sweep, fitted = FALSE, timetk_idx = TRUE)) %>%
+    unnest(sweep)
+
+#fcast.field.equip.fit.tidy
+
+#plot forecasts
+fcast.passenger.vehix.fit.tidy %>%
+    ggplot(aes(x = index, y = X538007...R.M.Passenger.Vehicles, color = key, group = Region.x)) +
+    geom_ribbon(aes(ymin = lo.95, ymax = hi.95), 
+                fill = "#D5DBFF", color = NA, size = 0) +
+    geom_ribbon(aes(ymin = lo.80, ymax = hi.80, fill = key), 
+                fill = "#596DD5", color = NA, size = 0, alpha = 0.8) +
+    geom_line() +
+    labs(title = "Passenger Vehicle Forecast by Region",
+         subtitle = "ETS Model Forecasts",
+         x = "", y = "Units") +
+    scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+    scale_color_tq() +
+    scale_fill_tq() +
+    facet_wrap(~ Region.x, scales = "free_y", ncol = 3) +
+    theme_tq() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r ETS Total Rolling Stock, echo=FALSE}
+num <- c(1,2,3,4,5,6)
+
+#ETS model passenger vehicle
+for (i in num){
+ plot <- autoplot(TS.RollStock.Data$rolling.stock.data.ts[[i]]) +
+           ggtitle(TS.RollStock.Data$Region.x[[i]])
+ print(plot)
+}
+
+#field equip fit
+total.rolling.stock.fit <- TS.RollStock.Data %>%
+  mutate(fit.ets = map(rolling.stock.data.ts, ets))
+
+#delivery.fit
+
+#model parameters
+total.rolling.stock.fit %>%
+  mutate(tidy = map(fit.ets, sw_tidy)) %>%
+  unnest(tidy, .drop = TRUE) %>%
+  spread(key = Region.x, value = estimate)
+
+#model accuracy
+total.rolling.stock.fit %>%
+  mutate(glance = map(fit.ets, sw_glance)) %>%
+  unnest(glance, .drop = TRUE)
+
+#fitted and residual values
+augment.total.rolling.stock.fit <- total.rolling.stock.fit %>%
+  mutate(augment = map(fit.ets, sw_augment, timetk_idx = TRUE, rename_index = "Date")) %>%
+  unnest(augment, .drop = TRUE)
+#fuel.augment.fit.ets
+
+#Plot model residuals
+augment.total.rolling.stock.fit %>%
+    ggplot(aes(x = Date, y = .resid, group = Region.x)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_line(color = palette_light()[[2]]) +
+    geom_smooth(method = "loess") +
+    labs(title = "Total Rolling Stock by Region",
+         subtitle = "ETS Model Residuals", x = "") + 
+    theme_tq() +
+    facet_wrap(~ Region.x, scale = "free_y", ncol = 3) +
+    scale_x_date(date_labels = "%Y")
+
+
+#forecast model
+fcast.total.rolling.stock.fit <- total.rolling.stock.fit %>%
+    mutate(fcast.total.rolling.stock = map(fit.ets, forecast, h = 12))
+#fcast.delivery.fit
+
+#fcast.delivery.fit
+
+#Tidy Forecast
+fcast.total.rolling.stock.fit.tidy <- fcast.total.rolling.stock.fit %>%
+    mutate(sweep = map(fcast.total.rolling.stock, sw_sweep, fitted = FALSE, timetk_idx = TRUE)) %>%
+    unnest(sweep)
+
+#fcast.field.equip.fit.tidy
+
+#plot forecasts
+fcast.total.rolling.stock.fit.tidy %>%
+    ggplot(aes(x = index, y = Rolling.Stock, color = key, group = Region.x)) +
+    geom_ribbon(aes(ymin = lo.95, ymax = hi.95), 
+                fill = "#D5DBFF", color = NA, size = 0) +
+    geom_ribbon(aes(ymin = lo.80, ymax = hi.80, fill = key), 
+                fill = "#596DD5", color = NA, size = 0, alpha = 0.8) +
+    geom_line() +
+    labs(title = "Total Rolling Stock Forecast by Region",
+         subtitle = "ETS Model Forecasts",
+         x = "", y = "Units") +
+    scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+    scale_color_tq() +
+    scale_fill_tq() +
+    facet_wrap(~ Region.x, scales = "free_y", ncol = 3) +
+    theme_tq() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
