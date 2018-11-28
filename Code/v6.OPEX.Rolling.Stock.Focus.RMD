@@ -1,0 +1,1090 @@
+---
+title: "v6.OPEX.Rolling.Stock.Focus"
+author: "Jason Marshall"
+date: "September 17, 2018"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libs, include=FALSE, echo=FALSE, include = FALSE}
+library(forecast) #time series forecast
+library(tidyquant)
+library(timetk) #edit time serices objects
+library(sweep) #tidy model outputs
+library(tidyverse) #tidy data
+library(broom) #tidy ts model outputs
+library(timeDate) #edit ts objects
+library(reshape2) #shape data
+library(data.table) #shape data setDT
+library(readr) #data inport
+library(corrr)      # Tidy correlation tables and correlation plotting
+library(cowplot)    # Multiple plots with plot_grid()
+library(tseries) #adf.test
+library(astsa) #lag plot
+library(TSA)
+#library(DataExplorer) #exploratory data analysis
+#library(Hmisc)
+#library(caret) #model building
+library(quantreg) #quantile regression
+library(GGally)
+```
+
+```{r func create compatible colnames, echo=FALSE}
+#create R compatible colnames
+func.unique.colNames <- function(dataset){
+  #1. Load Data
+  #2. Data Transforms
+  #3. Create a "wide" version of data
+  
+  #Get colnames
+  colsNamesShelf <-colnames(dataset)
+  # make unique col names
+  dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+  #set new colnames
+  colnames(dataset) <- dataset_col_names
+}
+```
+
+```{r func load expense data, echo = FALSE}
+#load expense data
+#edit column names
+#filter Division type
+
+func.load.exp <- function(path){
+  #load data
+  expense.dataset <- read_csv(path, col_types = cols(Amount = col_number()))
+  
+  #make unique colnames
+  colnames(expense.dataset) <- func.unique.colNames(expense.dataset)
+  
+  #add date column
+  expense.dataset <- expense.dataset %>%
+    #add day 01 just to get a complete date
+    mutate(day.holder = 01) %>%
+    #add year and month
+    mutate(date.holder = paste(Year, Acct.Per, day.holder, sep = "-"))
+  
+  #set date.holder as date
+  expense.dataset$date.holder <- as.Date(expense.dataset$date.holder)
+  
+  #get last day of the month
+  expense.dataset$Date <- as.Date(timeDate::timeLastDayInMonth(expense.dataset$date.holder))
+  
+  #Filter closed, wholesale, terminal, DC divisions
+  expense.dataset <- expense.dataset %>% 
+  filter(str_detect(Division, "Admin") == FALSE) %>% 
+  filter(str_detect(Division, "Closed") == FALSE) %>%
+  filter(str_detect(Division, "DC") == FALSE) %>%
+  filter(str_detect(Division, "Distribution") == FALSE) %>%
+  filter(str_detect(Division, "Wholesale") == FALSE) %>%
+  filter(str_detect(Division, "Terminals") == FALSE) %>%
+  filter(str_detect(Division, "Terminal") == FALSE)
+
+  #create summarized wide dataset
+  #select needed variables
+  #change strings to factors
+  expense.dataset <- expense.dataset %>% mutate_if(is.character, as.factor) %>%
+    #select variables
+    dplyr::select(Account, Region, Amount, Date) %>%
+    #group by account/region/date
+    group_by(Account, Region,Date) %>%
+    #sum expense amount
+    summarise(Amount = sum(Amount))
+  
+  #continue create wide version of data 
+  expense.dataset.wide <- dcast(data.table::setDT(expense.dataset), 
+                                     formula = Date + Region ~ Account,
+                                     value.var = c("Amount"),
+                                     fun.aggregate = sum)
+  
+  #edit colnames
+  colnames(expense.dataset.wide) <- gsub(pattern = " - ", 
+                                         replacement = ".", 
+                                         x = colnames(expense.dataset.wide))
+  #make unique col names
+  colnames(expense.dataset.wide) <- func.unique.colNames(expense.dataset.wide)
+  
+  #create variable: sum(Delivery/plan and field equip)
+  expense.dataset.wide <- expense.dataset.wide %>%
+    mutate(combo.plant.field = X538004.R.M.Delivery.Plant.Vehicles + 
+             X538006.R.M.Field.Equipment)
+  
+  #make total rollstock cols
+  expense.dataset.wide <- expense.dataset.wide %>%
+  mutate(Rolling.Stock =  
+           X538000.Fuel.Petrol + 
+           X538004.R.M.Delivery.Plant.Vehicles + 
+           X538006.R.M.Field.Equipment + 
+           X538007.R.M.Passenger.Vehicles)
+  
+  #return "wide" version of dataset
+  return(expense.dataset.wide)
+}
+```
+
+```{r func load sales data, echo = FALSE}
+#load sales data
+func.load.sales <- function(path){
+  #load sales data
+  US.Sales.Data <- read_csv(path) ###### Delete n_max after testing######
+  
+  #make uniques col names
+  colnames(US.Sales.Data) <- func.unique.colNames(US.Sales.Data)
+  
+  #edit date format 
+  US.Sales.Data$Invoice.Date <- as.Date(US.Sales.Data$Invoice.Date, format = '%B %d, %Y')
+  
+  #change invoice date to last month of the year for monthly sum and join with expense data
+  US.Sales.Data$Invoice.Date <- timeLastDayInMonth(US.Sales.Data$Invoice.Date)
+  
+  #change to character to facilitate group_by below
+  US.Sales.Data$Invoice.Date <- as.character(US.Sales.Data$Invoice.Date)
+  
+  #summarise by region
+  US.Sales.Data <- US.Sales.Data %>% select(Invoice.Date, Region, GL.Shelf, Net.Sales)
+  
+  #create wide version
+  US.Sales.Data.Wide <- dcast.data.table(data.table::setDT(US.Sales.Data),formula = Invoice.Date + Region ~ GL.Shelf,
+                   value.var = c("Net.Sales"),
+                   fun.aggregate = sum)
+  
+  #create total sales col
+  US.Sales.Data.Wide <- US.Sales.Data.Wide %>%
+    mutate(Total.Sales = (APPL + CHEM + FERT + OTHE + SEED))
+}
+```
+
+```{r func join sales data, echo=FALSE}
+#join sales and expense data
+func.join.datasets <- function(sales.dataset, expense.dataset){
+  #set region to uppper case
+  expense.dataset$Region <- toupper(expense.dataset$Region)
+  
+  #replace space in REGION with .
+  expense.dataset$Region <- gsub(" ", ".", expense.dataset$Region)
+  sales.dataset$Region <- gsub(" ", ".", sales.dataset$Region)
+  
+  #create Keys expense data
+  #paste date and region to get data by region by date
+  expense.dataset$key <- paste(expense.dataset$Date, expense.dataset$Region)
+  #put . in space between region and date
+  expense.dataset$key <- gsub(" ", ".", expense.dataset$key)
+  
+  #create keys sales data
+  #paste date and region to get data by region by date
+  sales.dataset$key <- paste(sales.dataset$Invoice.Date, sales.dataset$Region)
+  #fill space between date and region with "."
+  sales.dataset$key <- gsub(" ", ".", sales.dataset$key)
+  
+  #join data sets
+  US.Sales.RollStock.Data <- dplyr::inner_join(x = expense.dataset, y = sales.dataset,
+                                             by = "key")
+  #set Region to factor
+  US.Sales.RollStock.Data$Region.x <- as.factor(US.Sales.RollStock.Data$Region.x)
+  
+  #return dataset
+  return(US.Sales.RollStock.Data)
+}
+```
+
+```{r func nest data into tibbles}
+#nest datasets into tibbles
+func.nest.data <- function(dataset){
+  #consolidate each dataset by group
+  nested.dataset <- dataset %>%
+  group_by(Region.x) %>%
+  nest(.key = "ALL.DATA.TBL")
+  
+  #colnames(US.Sales.RollStock.Data)
+  nested.dataset <- nested.dataset %>%
+  #create new nested list for fuel/petrol only
+  # mutate(FUEL.TBL = map(ALL.DATA.TBL, ~select(.x, 
+  #                                                "Date", 
+  #                                                "X538000.Fuel.Petrol",
+  #                                             "Total.Sales"))) %>%
+  mutate(FUEL.TBL = map(ALL.DATA.TBL, ~select(.x, 
+                                                 "Date", 
+                                                 "X538000.Fuel.Petrol",
+                                              "Total.Sales"))) %>%
+  #create new nested list for Delivery Vehix
+  mutate(RM.DELIVERY.VEHIX.TBL = map(ALL.DATA.TBL, ~select(.x, 
+                                                    "Date", 
+                                                    "X538004.R.M.Delivery.Plant.Vehicles",
+                                              "Total.Sales"))) %>%
+  #create new nested list for Field Equip
+  mutate(RM.FIELD.EQUIP.TBL = map(ALL.DATA.TBL, ~select(.x, 
+                                                    "Date", 
+                                                    "X538006.R.M.Field.Equipment",
+                                              "Total.Sales"))) %>%
+  #create new nested list for Field Equip
+  mutate(COMBO.PLANT.FIELD.TBL = map(ALL.DATA.TBL, ~select(.x, 
+                                                    "Date", 
+                                                    "combo.plant.field",
+                                              "Total.Sales"))) %>%
+  #create new nested list for Rolling Stock Total
+  mutate(ROLL.STOCK.TOTAL.TBL = map(ALL.DATA.TBL, ~select(.x, 
+                                                         "Date", 
+                                                         "Rolling.Stock",
+                                              "Total.Sales"))) %>%
+  #create new nested list for total net sales
+  mutate(TOTAL.SALES.TBL = map(ALL.DATA.TBL, ~select(.x,
+                                                          "Date",
+                                                          "Total.Sales")))
+  return(nested.dataset)
+}
+```
+
+```{r func.mutate.to.XTS, echo=FALSE}
+func.mutate.to.XTS <- function(nested.dataset, old.var.name, new.var.name.TS = NULL, start.var, freq.var){
+  #set varnames to names to use in function
+  old.var.name <- as.symbol(old.var.name)
+  new.var.name.TS <- paste(old.var.name, ".XTS", sep = "")
+  #nest datasets in to TS objects
+  #ADD TIMES SERIES OBJECTS TO ORIGNINAL NESTED DATASET
+  nested.dataset.TS <- nested.dataset %>%
+    mutate(!!new.var.name.TS := map(
+      .x =nested.dataset[[old.var.name]],
+      #convert to xts object
+      .f = timetk::tk_xts,
+      start = start.var,
+      freq = freq.var
+    ))
+  }
+```
+
+```{r func.mutate.to.TS, echo=FALSE}
+func.mutate.to.TS <- function(nested.dataset, old.var.name, new.var.name.TS = NULL, start.var, freq.var){
+  #set varnames to names to use in function
+  old.var.name <- as.symbol(old.var.name)
+  new.var.name.TS <- paste(old.var.name, ".TS", sep = "")
+  #nest datasets in to TS objects
+  #ADD TIMES SERIES OBJECTS TO ORIGNINAL NESTED DATASET
+  nested.dataset.TS <- nested.dataset %>%
+    mutate(!!new.var.name.TS := map(
+      .x =nested.dataset[[old.var.name]],
+      #convert to ts object
+      .f = timetk::tk_ts,
+      start = start.var,
+      freq = freq.var
+    ))
+  }
+```
+
+```{r func FIT Mod, echo=FALSE}
+func.fit.mod.ets <- function(nested.dataset, colName){
+  #Set names for variable
+  colName <- as.name(colName)
+  #model.type <- as.name(model.type)
+  
+  #fit/map forecast model to nested dataset
+  model.fit <- nested.dataset %>%
+    mutate(ets.fit = map(.x = nested.dataset[[colName]][[1]][2],
+                                .f = ets))
+
+  #get model stats
+  model.stats <- model.fit %>%
+    #use sw_glance to get model quality stats
+    mutate(tidy.stats = map(
+      .x = model.fit$ets.fit,
+      .f = sw_glance)) #%>%
+    # unnest(tidy.stats, .drop = TRUE) #%>%
+    # mutate(Variable.Name = rep(as.character(colName))) %>%
+    #          select(Region.x, model.desc, AIC, BIC, RMSE, MAPE, Variable.Name)
+  return(model.stats)
+}
+
+####################   
+#   #forecast model
+#   fcast.model.fit <- model.fit %>%
+#     mutate(fcast = map(.x = .[[new.colName]],
+#                        .f = forecast,
+#                        h = 12))
+#   
+#   #get tidy forecast data
+#   fcast.model.tidy <- fcast.model.fit %>%
+#     #add forecast variable
+#     mutate(fcast.tidy = map(.x = fcast.model.fit,
+#                             .f = sw_sweep,
+#                             fitted = TRUE,
+#                             timetk_idx = TRUE)) %>%
+#     #unnest forecast variable
+#     unnest(fcast.tidy)
+#   
+#   #plot forecast 
+#   data.plot.fcast <- fcast.model.tidy %>%
+#     ggplot(mapping = aes_string(x =  names(fcast.model.tidy)[2], 
+#                       y = names(fcast.model.tidy)[4], 
+#                       color = names(fcast.model.tidy)[3], 
+#                       group = names(fcast.model.tidy)[1])) + 
+#     geom_ribbon(aes(ymin = lo.95, ymax = hi.95), 
+#                 fill = "#D5DBFF", color = NA, size = 0) +
+#     geom_ribbon(aes(ymin = lo.80, ymax = hi.80, fill = key), 
+#                 fill = "#596DD5", color = NA, size = 0, alpha = 0.8) +
+#     geom_line() +
+#     labs(title = fcast.plot.title,
+#          subtitle = "Model Forecasts",
+#          x = "", y = "Units") +
+#     scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+#     scale_color_tq() +
+#     scale_fill_tq() +
+#     facet_wrap(~ Region.x, scales = "free_y", ncol = 2) +
+#     theme_tq() +
+#     theme(axis.text.x = element_text(angle = 45, hjust = 1))
+#   
+#   return.list <- list(model.stats, data.plot.fcast)
+#   return(return.list)
+# }
+```
+
+```{r func ets mod, echo=FALSE}
+
+func.ets.mods <- function(nested.dataset, colName,
+                          Exp.Variable,
+                          Res.Plot.Title = "Insert.Plot.Title",
+                          fcast.plot.title = "Insert Plot Title"){
+  #test vars
+  # nested.dataset <- TS.Nest.US.Sales.RollStock.Data
+  # colName <- TS.Nest.US.Sales.RollStock.Data$FUEL.TBL.TS
+  # Res.Plot.Title <- "Insert.Plot.Title"
+  # fcast.plot.title <- "Insert Plot Title"
+  #fit model
+  
+  model.fit <- nested.dataset %>%
+    mutate(new.col.model.name = map(colName, ets))
+  
+  #forecast model
+  fcast.model.fit <- model.fit %>%
+    mutate(fcast.model = map(new.col.model.name, forecast, h = 12))
+  
+  #model parameters
+  #ETS
+  model.params <- model.fit %>%
+    mutate(tidy = map(new.col.model.name, sw_glance)) %>%
+    unnest(tidy, .drop=TRUE)%>%
+    mutate(Exp.Variable = rep(Exp.Variable)) %>%
+    select(Region.x, model.desc, AIC, BIC, RMSE, MAPE, Exp.Variable)
+
+  #get tidy model residuals
+  augment.data <- model.fit %>%
+    mutate(augment.var = map(new.col.model.name, 
+                         sw_augment, 
+                         timetk_idx = TRUE, 
+                         rename_index = "Date")) %>%
+    unnest(augment.var, .drop = TRUE) 
+  
+  #plot model residuals 
+  data.plot.residuals <- augment.data %>%
+    ggplot(aes(x = Date, y = .resid, group = Region.x)) +
+    geom_hline(yintercept = 0, color = "grey40") +
+    geom_line(color = palette_light()[[2]]) +
+    geom_smooth(method = "loess") +
+    labs(title = Res.Plot.Title,
+         subtitle = "ETS Model Residuals", x = "") +
+    theme_tq() +
+    facet_wrap(~ Region.x, scale = "free_y", ncol = 3) +
+    scale_x_date(date_labels = "%Y")
+  
+  #get tidy forecast data
+  fcast.model.fit.tidy <- fcast.model.fit %>%
+    mutate(sweep = map(fcast.model, 
+                       sw_sweep, 
+                       fitted = TRUE,
+                       timetk_idx = TRUE)) %>%
+    unnest(sweep)
+  
+  #plot fcast
+  data.plot.fcast <- fcast.model.fit.tidy %>%
+    ggplot(mapping = aes_string(x =  names(fcast.model.fit.tidy)[2], 
+                      y = names(fcast.model.fit.tidy)[4], 
+                      color = names(fcast.model.fit.tidy)[3], 
+                      group = names(fcast.model.fit.tidy)[1])) + 
+    geom_ribbon(aes(ymin = lo.95, ymax = hi.95), 
+                fill = "#D5DBFF", color = NA, size = 0) +
+    geom_ribbon(aes(ymin = lo.80, ymax = hi.80, fill = key), 
+                fill = "#596DD5", color = NA, size = 0, alpha = 0.8) +
+    geom_line() +
+    labs(title = fcast.plot.title,
+         subtitle = "ETS Model Forecasts",
+         x = "", y = "Units") +
+    scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+    scale_color_tq() +
+    scale_fill_tq() +
+    facet_wrap(~ Region.x, scales = "free_y", ncol = 2) +
+    theme_tq() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  #return.list <- list(model.params, data.plot.residuals, fcast.model.fit.tidy, data.plot.fcast)
+  return.list <- list(model.params, fcast.model.fit.tidy)
+  return(return.list)
+}
+```
+
+```{r load expense data , echo = FALSE}
+#check elapse time of function
+#system.time(func.load.exp("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/rolling.stock.focus/US.Rolling.Stock.Expense.csv"))
+
+#load expense data
+expense.data <- func.load.exp("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/rolling.stock.focus/US.Rolling.Stock.Expense.csv")
+```
+
+```{r load sales data, echo = FALSE}
+# system.time(func.load.sales("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US_Region_Division_Added_Only_NA_Item_Sales_chopdown_test a557ef9eb.csv"))
+
+US.Sales.Data <- func.load.sales("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US_Region_Division_Added_Only_NA_Item_Sales_chopdown_test a557ef9eb.csv")
+```
+
+```{r join datasets, echo = FALSE}
+#system.time(func.join.datasets(US.Sales.Data, expense.data))
+
+US.Sales.RollStock.Data <- func.join.datasets(US.Sales.Data, expense.data)
+```
+
+```{r nest data by Region, echo = FALSE}
+#system.time(nest.data(US.Sales.RollStock.Data))
+nested.dataset <- func.nest.data(US.Sales.RollStock.Data)
+#head(nested.dataset$RM.DELIVERY.VEHIX.TBL)
+```
+
+```{r nest data into XTS objects}
+#args(func.mutate.to.TS)
+#colnames(nested.dataset)
+
+#coerce fuel data
+xts.nested.dataset <- nested.dataset %>% 
+  func.mutate.to.XTS(nested.dataset = .,
+                                       old.var.name = "FUEL.TBL",
+                                      #keep name as null function will populate
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12) %>%
+#coerce RM.DELIVERY.VEHIX.TBL
+  func.mutate.to.XTS(nested.dataset = .,
+                                       old.var.name = "RM.DELIVERY.VEHIX.TBL",
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12) %>%
+#coerce RM.FIELD.EQUIP.TBL
+func.mutate.to.XTS(nested.dataset = .,
+                                       old.var.name = "RM.FIELD.EQUIP.TBL",
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12) %>%
+#coerce COMBO.PLANT.FIELD.TBL
+  func.mutate.to.XTS(nested.dataset = .,
+                                       old.var.name = "COMBO.PLANT.FIELD.TBL",
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12) %>%
+#coerce ROLL.STOCK.TOTAL.TBL
+  func.mutate.to.XTS(nested.dataset = .,
+                                       old.var.name = "ROLL.STOCK.TOTAL.TBL",
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12) %>%
+#coerce TOTAL.SALES.TBL
+  func.mutate.to.XTS(nested.dataset = .,
+                                       old.var.name = "TOTAL.SALES.TBL",
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12)
+
+head(xts.nested.dataset$FUEL.TBL.TS)
+```
+
+```{r nest data into TS objects}
+#args(func.mutate.to.TS)
+#colnames(nested.dataset)
+
+#coerce fuel data
+ts.nested.dataset <- nested.dataset %>% 
+  func.mutate.to.TS(nested.dataset = .,
+                                       old.var.name = "FUEL.TBL",
+                                      #keep name as null function will populate
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12) %>%
+#coerce RM.DELIVERY.VEHIX.TBL
+  func.mutate.to.TS(nested.dataset = .,
+                                       old.var.name = "RM.DELIVERY.VEHIX.TBL",
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12) %>%
+#coerce RM.FIELD.EQUIP.TBL
+func.mutate.to.TS(nested.dataset = .,
+                                       old.var.name = "RM.FIELD.EQUIP.TBL",
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12) %>%
+#coerce COMBO.PLANT.FIELD.TBL
+  func.mutate.to.TS(nested.dataset = .,
+                                       old.var.name = "COMBO.PLANT.FIELD.TBL",
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12) %>%
+#coerce ROLL.STOCK.TOTAL.TBL
+  func.mutate.to.TS(nested.dataset = .,
+                                       old.var.name = "ROLL.STOCK.TOTAL.TBL",
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12) %>%
+#coerce TOTAL.SALES.TBL
+  func.mutate.to.TS(nested.dataset = .,
+                                       old.var.name = "TOTAL.SALES.TBL",
+                                       new.var.name.TS = NULL,
+                                       start.var = 2014,
+                                       freq.var = 12)
+
+head(ts.nested.dataset$FUEL.TBL.TS)
+```
+
+```{r isolate to one column, echo=FALSE, include=FALSE}
+#get first col of nested list
+lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i = , j = 1)
+#get second col of nested list
+lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = 2)
+
+# #test on TS objects / Does not work for TS objects 
+# #get first col of nested list
+# as.ts(lapply(xts.nested.dataset$FUEL.TBL.XTS, `[`, i = , j = 1))[[1]]
+# #get second col of nested list
+# lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = 2)
+```
+
+```{r plot data, echo = FALSE}
+#plot fuel expense separately
+cols <- as.character(ts.nested.dataset$Region.x)
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  plot <- autoplot(lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]) +
+    ggtitle(paste("FUEL EXP", cols[i], sep = ": "))+ 
+    theme(legend.position="bottom")
+  print(plot)
+}
+
+#plot Net Sales separately
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  plot <- autoplot(lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(2))[[i]]) +
+    ggtitle(paste("Net Sales", cols[i], sep = ": "))+ 
+    theme(legend.position="bottom")
+  print(plot)
+}
+
+#plot both together
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  #Fuel Exp = 1
+  plot <- autoplot(ts.nested.dataset$FUEL.TBL.TS[[i]]) +
+        ggtitle(paste("Net Sales vs Fuel Exp", cols[i], sep = ": ")) + 
+    theme(legend.position="bottom")
+  print(plot)
+}
+
+```
+
+```{r EDA Fuel Exp, echo=FALSE}
+#season plot fuel expense separately
+cols <- as.character(ts.nested.dataset$Region.x)
+start <- 2014
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+  
+  plot <- ggseasonplot(ts.data) +
+    ggtitle(paste("Season Plot FUEL EXP", cols[i], sep = ": ")) + 
+    theme(legend.position="bottom")
+  print(plot)
+}
+
+#subseries plot fuel expense separately
+cols <- as.character(ts.nested.dataset$Region.x)
+start <- 2014
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+  
+  plot <- ggsubseriesplot(ts.data) +
+    ggtitle(paste("Subseries Plot FUEL EXP", cols[i], sep = ": ")) + 
+    theme(legend.position="bottom")
+  print(plot)
+}
+
+
+#boxplot of fuel separately
+cols <- as.character(ts.nested.dataset$Region.x)
+start <- 2014
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+  
+  plot <- boxplot(ts.data ~ cycle(ts.data), 
+                  main = paste("Box Plot:", cols[i], sep = " "))
+  print(plot)
+}
+
+#decompose ts objects
+cols <- as.character(ts.nested.dataset$Region.x)
+start <- 2014
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+  
+  plot <- ts.data %>%
+    decompose() %>% autoplot() +
+    ggtitle(paste("Decomposition FUEL EXP", cols[i], sep = ": "))
+  
+  print(plot)
+}
+```
+
+```{r ACF Fuel Exp, echo=FALSE}
+#ACF plot
+cols <- as.character(ts.nested.dataset$Region.x)
+start <- 2014
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+  
+  plot <- ts.data %>%
+    ggAcf() +
+    ggtitle(paste("ACF FUEL EXP", cols[i], sep = ": "))
+  
+  print(plot)
+}
+
+#2nd and Seasonal Diff
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+  
+  plot <- ts.data %>%
+    #log() %>%
+    diff(., 1) %>%
+    #diff(., 3) %>%
+    diff(., 12) %>%
+    ggAcf() +
+    ggtitle(paste("ACF FUEL EXP 1/12 DIFF", cols[i], sep = ": "))
+  
+  print(plot)
+}
+
+#plot diffed data
+cols <- as.character(ts.nested.dataset$Region.x)
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+  #use extraction function '[' to get to levels of nested lists
+  plot <- ts.data %>%
+    diff(., 1) %>%
+    diff(., 12) %>%
+    autoplot() +
+    geom_smooth(method = 'loess') +
+    ggtitle(paste("FUEL EXP 1/12 DIFF", cols[i], sep = ": "))+ 
+    theme(legend.position="bottom")
+  print(plot)
+}
+
+
+#######
+#adf.test
+adf.dataframe <- data_frame(diff.order = character(), Region = character(), P.Value = character())
+kpss.datafrme <- data_frame(diff.order = character(), Region = character(), P.Value = character())
+
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+
+  adf.data <- ts.data %>%
+    #log() %>%
+    diff(., 1) %>%
+    #diff(., 12) %>%
+    adf.test(., k = 12)
+  
+  kpss.data <- ts.data %>%
+    diff(., 1) %>%
+    kpss.test(.)
+
+  #set diff order
+  adf.dataframe[i,1] <- "1st Diff"
+  #get region
+  adf.dataframe[i,2] <- cols[i]
+  #get pvalue
+  adf.dataframe[i,3] <- adf.data[4]
+  
+  #set diff order
+  kpss.datafrme[i,1] <- "1st Diff"
+  #get region
+  kpss.datafrme[i,2] <- cols[i]
+  #get pvalue
+  kpss.datafrme[i,3] <- kpss.data$p.value
+  }
+
+adf.dataframe
+kpss.datafrme
+
+```
+
+
+```{r EDA 2 Test Stationarity fuel exp, echo=FALSE, include=FALSE}
+# ###############
+# #adf.test no diff
+# adf.dataframe.nodiff <- data_frame(diff.order = character(), Region = character(), P.Value = character())
+# for (i in 1:length(ts.nested.dataset$Region.x)){
+#   #use extraction function '[' to get to levels of nested lists
+#   xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+#   ts.data <- ts(xts.data, start = start, frequency = 12)
+#   
+#   adf.data <- adf.test(ts.data, k = 12 )
+#   
+#   #set diff order
+#   adf.dataframe.nodiff[i,1] <- "No Diff"
+#   #get region
+#   adf.dataframe.nodiff[i,2] <- cols[i]
+#   #get pvalue
+#   adf.dataframe.nodiff[i,3] <- adf.data[4]
+# }
+# 
+# adf.dataframe.nodiff
+# #comment: Data Not Stationary
+# 
+# ###############
+# #adf.test first diff
+# adf.dataframe.first.diff <- data_frame(diff.order = character(), Region = character(), P.Value = character())
+# for (i in 1:length(ts.nested.dataset$Region.x)){
+#   #use extraction function '[' to get to levels of nested lists
+#   xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+#   ts.data <- ts(xts.data, start = start, frequency = 12)
+#   
+#   adf.data <- adf.test(diff(ts.data, 1), k = 12)
+#   
+#  #set diff order
+#   adf.dataframe.first.diff[i,1] <- "1st Diff"
+#   #get region
+#   adf.dataframe.first.diff[i,2] <- cols[i]
+#   #get pvalue
+#   adf.dataframe.first.diff[i,3] <- adf.data[4]
+# }
+# 
+# adf.dataframe.first.diff
+# 
+# ###############
+# #adf.test  log first diff
+# adf.dataframe.log.first.diff <- data_frame(diff.order = character(), Region = character(), P.Value = character())
+# for (i in 1:length(ts.nested.dataset$Region.x)){
+#   #use extraction function '[' to get to levels of nested lists
+#   xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+#   ts.data <- ts(xts.data, start = start, frequency = 12)
+#   
+#   adf.data <- adf.test(diff(log(ts.data), 1), k = 12)
+#   
+#  #set diff order
+#   adf.dataframe.log.first.diff[i,1] <- "log 1st Diff"
+#   #get region
+#   adf.dataframe.log.first.diff[i,2] <- cols[i]
+#   #get pvalue
+#   adf.dataframe.log.first.diff[i,3] <- adf.data[4]
+# }
+# 
+# adf.dataframe.log.first.diff
+# 
+# ###############
+# #adf.test  log first diff seasonal diff
+# adf.dataframe.log.first.seasonal.diff <- data_frame(diff.order = character(), Region = character(), P.Value = character())
+# for (i in 1:length(ts.nested.dataset$Region.x)){
+#   #use extraction function '[' to get to levels of nested lists
+#   xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+#   ts.data <- ts(xts.data, start = start, frequency = 12)
+#   
+#   adf.data <- adf.test(diff(diff(log(ts.data), 12),1), k = 12)
+#   
+#   #set diff order
+#   adf.dataframe.log.first.seasonal.diff[i,1] <- "log first Season Diff"
+#   #get region
+#   adf.dataframe.log.first.seasonal.diff[i,2] <- cols[i]
+#   #get pvalue
+#   adf.dataframe.log.first.seasonal.diff[i,3] <- adf.data[4]
+# }
+# adf.dataframe.log.first.seasonal.diff
+# #comment:did not work 
+# 
+# ###############
+# #adf.test seasonal diff
+# adf.dataframe.seasonal.diff <- data_frame(diff.order = character(), Region = character(), P.Value = character())
+# for (i in 1:length(ts.nested.dataset$Region.x)){
+#   #use extraction function '[' to get to levels of nested lists
+#   xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+#   ts.data <- ts(xts.data, start = start, frequency = 12)
+#   
+#   adf.data <- adf.test(diff(ts.data, 12), k = 12)
+#   
+#   #set diff order
+#   adf.dataframe.seasonal.diff[i,1] <- "Season Diff"
+#   #get region
+#   adf.dataframe.seasonal.diff[i,2] <- cols[i]
+#   #get pvalue
+#   adf.dataframe.seasonal.diff[i,3] <- adf.data[4]
+# }
+# adf.dataframe.seasonal.diff
+# 
+# 
+# adf.final.df <- bind_rows(adf.dataframe.nodiff, adf.dataframe.first.diff, adf.dataframe.log.first.seasonal.diff, adf.dataframe.seasonal.diff)
+# adf.final.df
+
+```
+
+
+
+
+```{r EDA Net Sales}
+#season plot net sales separately
+cols <- as.character(ts.nested.dataset$Region.x)
+start <- 2014
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(2))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+  
+  plot <- ggseasonplot(ts.data) +
+    ggtitle(paste("Season Plot Net Sales", cols[i], sep = ": ")) + 
+    theme(legend.position="bottom")
+  print(plot)
+}
+```
+
+```{r ACF Net Sales, echo=FALSE}
+#ACF plot
+cols <- as.character(ts.nested.dataset$Region.x)
+start <- 2014
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(2))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+  
+  plot <- ts.data %>%
+    ggAcf() +
+    ggtitle(paste("ACF Net Sale", cols[i], sep = ": "))
+  
+  print(plot)
+}
+
+#2nd and Seasonal Diff
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(2))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+  
+  plot <- ts.data %>%
+    #log() %>%
+    diff(., 1) %>%
+    #diff(., 3) %>%
+    diff(., 12) %>%
+    ggAcf() +
+    ggtitle(paste("ACF Net Sales 1/12 Diff", cols[i], sep = ": "))
+  
+  print(plot)
+}
+
+#plot diffed data
+cols <- as.character(ts.nested.dataset$Region.x)
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(2))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+  #use extraction function '[' to get to levels of nested lists
+  plot <- ts.data %>%
+    #log() %>%
+    diff(., 1) %>%
+    #diff(., 3) %>%
+    diff(., 12) %>%
+    autoplot() +
+    geom_smooth(method = 'loess') +
+    ggtitle(paste("Net Sales", cols[i], sep = ": "))+ 
+    theme(legend.position="bottom")
+  print(plot)
+}
+
+
+#######
+#adf.test/kpss.test 
+adf.dataframe <- data_frame(diff.order = character(), Region = character(), P.Value = character())
+kpss.datafrme <- data_frame(diff.order = character(), Region = character(), P.Value = character())
+
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(2))[[i]]
+  ts.data <- ts(xts.data, start = start, frequency = 12)
+
+  adf.data <- ts.data %>%
+    #log() %>%
+    diff(., 1) %>%
+    #diff(., 12) %>%
+    adf.test(., k = 12)
+  
+  kpss.data <- ts.data %>%
+    diff(., 1) %>%
+    kpss.test(.)
+
+  #set diff order
+  adf.dataframe[i,1] <- "1st/12th Diff"
+  #get region
+  adf.dataframe[i,2] <- cols[i]
+  #get pvalue
+  adf.dataframe[i,3] <- adf.data[4]
+  
+  #set diff order
+  kpss.datafrme[i,1] <- "1st/12th Diff"
+  #get region
+  kpss.datafrme[i,2] <- cols[i]
+  #get pvalue
+  kpss.datafrme[i,3] <- kpss.data$p.value
+  }
+
+adf.dataframe
+kpss.datafrme
+
+```
+
+#scatter plot
+#Cross Correlations
+```{r fuel sales to fuel exp, echo=FALSE}
+
+for (i in 1:length(ts.nested.dataset$Region.x)){
+  #use extraction function '[' to get to levels of nested lists
+  xts.data.fuel <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))[[i]]
+  ts.data.fuel <- xts.data.fuel %>%
+    #log() %>%
+    diff(., 1) %>%
+    #diff(., 3) %>%
+    diff(., 12)
+  
+  xts.data.sales <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(2))[[i]]
+  ts.data.sales <- xts.data.sales %>%
+    #log() %>%
+    diff(., 1) %>%
+    #diff(., 3) %>%
+    diff(., 12)
+  
+  #convert data to tibble for plotting
+  new.dataset <- merge(ts.data.fuel, ts.data.sales) %>%
+  timetk::tk_tbl() %>%
+    na.omit()
+  
+  
+  scatter.plot <- ggplot(new.dataset, aes(x = new.dataset$Total.Sales, 
+                                  y = new.dataset$X538000.Fuel.Petrol)) +
+    geom_point() +
+    geom_smooth(method = 'lm') + 
+    geom_smooth(method = 'loess', color = 'red') +
+    ggtitle(paste("Scatter Plot", cols[i], sep = ": "))
+  
+  print(scatter.plot)
+  
+  CCF.plot <- ggCcf(x = new.dataset$Total.Sales, 
+                                  y = new.dataset$X538000.Fuel.Petrol) +
+    ggtitle(paste("CCF Plot", cols[i], sep = ": "))
+  
+  print(CCF.plot)
+}
+
+ggCcf(x = new.dataset$Total.Sales, 
+                                  y = new.dataset$X538000.Fuel.Petrol)
+```
+
+```{r ETS Model Metrics}
+#debug(func.fit.mod.ets)
+#undebug(func.fit.mod.ets)
+
+#rm(ets.model.fuel)
+#args(func.fit.mod)
+#colnames(ts.nested.dataset)
+#ets.model.fuel <- func.fit.mod.ets(nested.dataset = ts.nested.dataset$FUEL.TBL.TS,
+#                               colName = "FUEL.TBL.TS")
+#ets.model.fuel$ets.fit
+
+xts.data.fuel <- lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1))
+
+ts.nested.dataset <- ts.nested.dataset %>%
+  mutate(ts.nested.fuel.only = map(lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1)),
+                                      ts,start = 2014, frequency = 12))
+
+#######
+#colnames(ts.nested.dataset)
+#func.ets.mods()
+ets.model.fuel <- func.ets.mods(nested.dataset = ts.nested.dataset, Exp.Variable = "FUEL.Exp",
+                                colName = ts.nested.dataset$ts.nested.fuel.only)
+#ets.model.fuel
+
+# ets.model.delivery <- func.ets.mods(nested.dataset = ts.nested.dataset, Exp.Variable = "Delivery",
+#                                 colName = ts.nested.dataset$RM.DELIVERY.VEHIX.TBL.TS)
+# #ets.model.delivery
+# 
+# ets.model.field <- func.ets.mods(nested.dataset = ts.nested.dataset, Exp.Variable = "Field",
+#                                 colName = ts.nested.dataset$RM.FIELD.EQUIP.TBL.TS)
+# #ets.model.field
+# 
+# ets.model.combo <- func.ets.mods(nested.dataset = ts.nested.dataset, Exp.Variable = "Delivery/Field",
+#                                 colName = ts.nested.dataset$COMBO.PLANT.FIELD.TBL.TS)
+# #ets.model.combo
+# 
+# ets.model.rolls.stock <- func.ets.mods(nested.dataset = ts.nested.dataset, Exp.Variable = "Roll.Stock.Total",
+#                                 colName = ts.nested.dataset$ROLL.STOCK.TOTAL.TBL.TS)
+# #ets.model.rolls.stock[[1]]
+# 
+# ets.metrics <- rbind(ets.model.fuel[[1]], ets.model.delivery[[1]], ets.model.field[[1]],
+#                      ets.model.combo[[1]], ets.model.rolls.stock[[1]])
+# ets.metrics
+# 
+# ets.model.fuel[[2]]
+# ets.fcast <- rbind(ets.model.fuel[[2]], ets.model.delivery[[2]], ets.model.field[[2]],
+#                      ets.model.combo[[2]], ets.model.rolls.stock[[2]])
+# ets.metrics
+
+#print metrics
+ets.model.fuel[[1]]
+#print forecast data
+ets.model.fuel[[2]]
+```
+
+```{r normal ARIMA, echo=FALSE}
+ts.nested.dataset <- ts.nested.dataset %>%
+  mutate(ts.nested.fuel.only = map(lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(1)),
+                                      ts,start = 2014, frequency = 12))
+
+#fit arima model
+monthly.sales.fit.arima <- ts.nested.dataset %>%
+  mutate(fit.arima = map(.x = ts.nested.fuel.only, .f = ~auto.arima(.,D = 1, stepwise = FALSE, seasonal = TRUE)))
+
+monthly.sales.fit.arima$fit.arima
+```
+
+```{r ARIMA with XREG, echo=FALSE}
+#ARIMA with sales and xreg
+ts.nested.dataset <- ts.nested.dataset %>%
+  mutate(ts.nested.sales.only = map(lapply(xts.nested.dataset$FUEL.TBL.XTS, '[', i =, j = c(2)),
+                                      ts,start = 2014, frequency = 12))
+
+monthly.sales.fit.arima <- ts.nested.dataset %>%
+  mutate(fit.arima.xreg = map2(.x = ts.nested.fuel.only, .y = ts.nested.sales.only,
+                               .f= ~auto.arima(.,D = 1, stepwise = FALSE, seasonal = TRUE, xreg = .y)))
+
+monthly.sales.fit.arima$fit.arima.xreg
+```
+
+
+
+
+
+
+
+
+
+

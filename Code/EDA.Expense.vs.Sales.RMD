@@ -1,0 +1,809 @@
+---
+title: "Data Mix Sales/Expense"
+author: "Jason Marshall"
+date: "November 20, 2018"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libs, include=FALSE, echo=FALSE, include = FALSE}
+library(forecast) #time series forecast
+library(tidyquant)
+library(timetk) #edit time serices objects
+library(sweep) #tidy model outputs
+library(tidyverse) #tidy data
+library(broom) #tidy ts model outputs
+library(timeDate) #edit ts objects
+library(reshape2) #shape data
+library(data.table) #shape data setDT
+library(readr) #data inport
+library(corrr)      # Tidy correlation tables and correlation plotting
+library(cowplot)    # Multiple plots with plot_grid()
+library(tseries) #adf.test
+library(astsa) #lag plot
+library(TSA)
+#library(DataExplorer) #exploratory data analysis
+#library(Hmisc)
+#library(caret) #model building
+library(quantreg) #quantile regression
+```
+
+```{r load expense data from above code chunk, echo=FALSE}
+####################################################################################
+expense.dataset <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US.opex.test.full.csv")
+
+
+#Filter closed, wholesale, terminal, DC divisions
+expense.dataset <- expense.dataset %>% 
+  filter(str_detect(Division, "Admin") == FALSE) %>% 
+  filter(str_detect(Division, "Closed") == FALSE) %>%
+  filter(str_detect(Division, "DC") == FALSE) %>%
+  filter(str_detect(Division, "Distribution") == FALSE) %>%
+  filter(str_detect(Division, "Wholesale") == FALSE) %>%
+  filter(str_detect(Division, "Terminals") == FALSE) %>%
+  filter(str_detect(Division, "Terminal") == FALSE)
+
+#change strings to factors
+expense.dataset <- expense.dataset %>% mutate_if(is.character, as.factor)
+
+#unit test
+#unique(expense.dataset$Division)
+levels(expense.dataset$Division)
+
+#summary check
+summary(expense.dataset)
+
+#fill NAs
+#expense.dataset %>% filter(is.na(Amount))
+expense.dataset$Amount <- replace_na(expense.dataset$Amount, 0)
+
+#summary check
+#expense.dataset %>% group_by(Division) %>% summarise(sum = sum(Amount))
+#summary(expense.dataset)
+```
+
+```{r create time series object: US Country Level, echo=FALSE}
+#subset down to US Total Sum
+US.Total.Expense.Dataset <- expense.dataset %>%
+  #group by US
+  group_by(Date, Parent.Account, Geography) %>%
+  #sum expense amounts
+  summarise(Expense.Sum = sum(Amount))
+
+summary(US.Total.Expense.Dataset)
+
+#unit test
+sum(expense.dataset$Amount) == sum(US.Total.Expense.Dataset$Expense.Sum)
+
+########### make wide version ###########
+US.Total.Expense.Dataset <- dcast(data.table::setDT(US.Total.Expense.Dataset), 
+                                     formula = Date + Geography ~ Parent.Account,
+                                     value.var = c("Expense.Sum"),
+                                     fun.aggregate = sum)
+#summary check
+#summary(US.Total.Expense.Dataset)
+
+#fill NAs 
+#US.Total.Expense.Dataset[is.na(US.Total.Expense.Dataset)] <- 0
+
+#sort oldest to newest
+US.Total.Expense.Dataset <- US.Total.Expense.Dataset %>%
+  arrange(Date)
+
+#create ts object drop first two cols (non-numeric)
+US.Total.Expense.Dataset.XTS <- timetk::tk_xts(data = US.Total.Expense.Dataset,
+                                              #drop Geography
+                                              select = -c(Geography),
+                                              date_var = Date)
+#Unit Test
+#summary(US.Total.Expense.Dataset.TS)
+start(US.Total.Expense.Dataset.XTS)
+end(US.Total.Expense.Dataset.XTS)
+
+#drop other datasets to help with file size
+rm(expense.dataset)
+#rm(US.Total.Expense.Dataset)
+```
+
+```{r Use all of the data, echo=FALSE}
+#US.Roll.Stock <- US.Total.Expense.Dataset[,c('Date', 'Geography', 'ROLLING_STOCK')]
+
+#create ts object drop first two cols (non-numeric)
+US.Total.Expense.Dataset.TS <- timetk::tk_ts(data = US.Total.Expense.Dataset.XTS, 
+                                     start = c(2013,01), frequency = 12)
+
+#cut data set down to 2014 to match sales data
+US.Total.Expense.Dataset.TS <- window(US.Total.Expense.Dataset.TS, start = c(2014,1))
+
+#US.Total.Expense.Dataset.roll.stock.TS
+```
+
+```{r add sales data, echo=FALSE}
+US.Sales.Data <- read_csv("Y:/Sharepoint Projects/Jason Marshall/R_Projects/OPEX_Forecasting/Data/US_Region_Division_Added_Only_NA_Item_Sales_chopdown_test a557ef9eb.csv")
+
+# #make unique col names
+colsNamesShelf <-colnames(US.Sales.Data)
+dataset_col_names <- make.names(colsNamesShelf, unique = TRUE)
+colnames(US.Sales.Data) <- dataset_col_names
+
+#edit date format 
+US.Sales.Data$Invoice.Date <- as.Date(US.Sales.Data$Invoice.Date, format = '%B %d, %Y')
+
+#change invoice date to last month of the year for monthly sum and join with expense data
+US.Sales.Data$Invoice.Date <- timeLastDayInMonth(US.Sales.Data$Invoice.Date) 
+
+#change to character to facilitate group_by below
+US.Sales.Data$Invoice.Date <- as.character(US.Sales.Data$Invoice.Date)
+```
+
+```{r shape sales data, echo=FALSE}
+#Sum net sales and total margin for US Total
+US.Sales.Data <- US.Sales.Data %>%
+  #Select Data
+  dplyr::select(Invoice.Date, GL.Shelf, Net.Sales, Total.Margin) %>%
+  dplyr::group_by(Invoice.Date, GL.Shelf) %>% 
+  dplyr::summarise(Net.Sales = sum(Net.Sales), Total.Margin = sum(Total.Margin))
+  
+#unit test
+sum(US.Sales.Data$Net.Sales) == sum(US.Sales.Data$Net.Sales)
+sum(US.Sales.Data$Total.Margin) == sum(US.Sales.Data$Total.Margin)
+```
+
+```{r US Sales Time Series, echo=FALSE}
+#convert us.sales.data.cutdown to date for sort
+US.Sales.Data$Invoice.Date <- as.Date(US.Sales.Data$Invoice.Date)
+#sort by date
+US.Sales.Data$Invoice.Date <- sort(US.Sales.Data$Invoice.Date, decreasing = FALSE)
+
+#create ts object
+US.Sales.Data.TS <- US.Sales.Data %>%
+  dplyr::select(Invoice.Date, GL.Shelf, Net.Sales, Total.Margin)
+
+#create wide version of data
+US.Sales.Data.wide.TS <- dcast(data = data.table::setDT(US.Sales.Data.TS), 
+                                  formula = Invoice.Date ~ GL.Shelf,
+                                  value.var = c('Net.Sales', 'Total.Margin'),
+                                  fun.aggregate = sum) %>%
+  #Net.Sales.Total
+  mutate(Net.Sales_Total = (Net.Sales_APPL + Net.Sales_CHEM + Net.Sales_FERT + Net.Sales_OTHE + Net.Sales_SEED)) %>%
+  #Total.Margin.Total
+  mutate(Total.Margin_Total = (Total.Margin_APPL + Total.Margin_CHEM + Total.Margin_FERT + Total.Margin_OTHE + Total.Margin_SEED))
+
+#convert to ts object
+US.Sales.Data.wide.TS <- timetk::tk_ts_(US.Sales.Data.wide.TS, start = c(2014,1), frequency = 12)
+```
+
+```{r Join sales and expense data, echo=FALSE}
+
+#join ts objects
+US.Sales.Expense.TS <- ts.intersect(US.Total.Expense.Dataset.TS, US.Sales.Data.wide.TS)
+
+#edit colnames
+colnames(US.Sales.Expense.TS)
+colnames(US.Sales.Expense.TS) <- gsub(pattern = "US.Total.Expense.Dataset.TS.\\.|US.Sales.Data.wide.TS.", 
+                                        replacement = "", x = colnames(US.Sales.Expense.TS))
+
+colnames(US.Sales.Expense.TS) <- gsub(pattern = "US.Sales.Data.wide.TS.Net.", 
+                                        replacement = "", x = colnames(US.Sales.Expense.TS))
+
+```
+
+##Time Series EDA
+#Univariate
+```{r Season Plot for each variable, echo=FALSE}
+cols <- colnames(US.Sales.Expense.TS)
+
+for (i in cols){
+  data.plot <- ggseasonplot(US.Sales.Expense.TS[,i]) +
+    ggtitle(paste("Season Plot:", i, sep = " "))
+  print(data.plot)
+}
+```
+
+```{r sub Season Plot for each variable}
+cols <- colnames(US.Sales.Expense.TS)
+
+for (i in cols){
+  data.plot <- ggsubseriesplot(US.Sales.Expense.TS[,i]) +
+    ggtitle(paste("Subseries Plot:", i, sep = " "))
+  
+  print(data.plot)
+}
+```
+
+```{r Box  Plot for each variable}
+cols <- colnames(US.Sales.Expense.TS)
+
+for (i in cols){
+  box.plot <- boxplot(US.Sales.Expense.TS[,i] ~ cycle(US.Sales.Expense.TS[,i]), 
+                      main = paste("Box Plot:", i, sep = " "))
+  print(box.plot)
+  }
+```
+
+```{r plot variables against admin charge, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(1,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+```
+
+```{r plot  sales variables against bad debt, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(2,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+```
+
+```{r plot  sales variables against BURDEN, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(3,32:43)]
+#colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+```
+
+```{r plot  sales variables against DEPR_AMORT, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(4,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+#possibly a fixed cost
+
+```
+
+```{r plot  sales variables against EMPLOYEE_EXPENSE, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(5,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against ENVMNTL_SAFETY_EXP, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(6,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against ERL_ARO_EXP, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(7,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against FX_GAIN_LOSS, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(8,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against GA_EXPENSES, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(9,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against HOURLY WAGES, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(10,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+
+```{r plot  sales variables against INC_EXP_OTHER, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(11,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against INCENTIVE, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(12,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against INSURANCE_PREMIUMS, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(13,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against INTERBRANCH_CHRG, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(14,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against INTEREST_INCOME, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(15,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against LESS_DEPR_AMORT_EXP, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(16,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against LESS_GA_EXP, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(17,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against LESS_GA_EXP, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(18,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+
+```{r plot  sales variables against LOSS_DAMAGE_CLAIMS, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(19,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against MAINTENANCE, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(20,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+
+```{r plot  sales variables against MARKETING, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(21,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+
+```{r plot  sales variables against OFFICE_EXPENSE, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(22,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against OTHER EXPENSES, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(23,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+```
+
+
+```{r plot  sales variables against OUTSIDE_SERVICES, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(24,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against OVERTIME, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(25,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against RENTAL, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(26,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against RETIRE_GAIN_LOSS, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(27,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against ROLLING_STOCK, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(28,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against SALARIES, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(29,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against TAXES_LICENSES, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(30,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+```{r plot  sales variables against UTILITIES, echo=FALSE}
+#colnames(US.Sales.Expense.TS)
+
+dataset <- US.Sales.Expense.TS[,c(31,32:43)]
+colnames(dataset)[1]
+
+xvar_name <- colnames(dataset)[1]
+cols <- colnames(dataset)
+#cols[i]
+for (i in 2:length(cols)){
+  data.plot <- autoplot(dataset[,c(1,i)]) + 
+    ggtitle(paste(xvar_name,":", cols[i], sep = " ")) +
+    theme(legend.position="bottom")
+  print(data.plot)
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
